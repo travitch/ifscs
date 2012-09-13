@@ -15,7 +15,12 @@ tests = [
      testCase "tc3" tc3,
      testCase "tc4" tc4,
      testCase "tc5" tc5,
-     testCase "tc6" tc6
+     testCase "tc6" tc6,
+     testCase "tc7" tc7,
+     testCase "tc8" tc8,
+     testCase "tc9" tc9,
+     testCase "tc10" tc10,
+     testCase "tc11" tc11
      ]
   ]
 
@@ -90,7 +95,102 @@ tc6 =
                           , setVariable "a" <=! setVariable "b"
                           ]
 
+-- Make a longer cycle
+tc7 :: Assertion
+tc7 =
+  assertEqual "tc7" [5, 6, 7, 8 :: Int] (sort sol)
+  where
+    Just solved = solveSystem cs
+    Just sol = leastSolution solved "f"
+    cs = constraintSystem [ atom 5 <=! setVariable "b"
+                          , atom 6 <=! setVariable "b"
+                          , atom 7 <=! setVariable "a"
+                          , atom 8 <=! setVariable "a"
+                          , setVariable "b" <=! setVariable "a"
+                          , setVariable "c" <=! setVariable "b"
+                          , setVariable "d" <=! setVariable "c"
+                          , setVariable "e" <=! setVariable "d"
+                          , setVariable "f" <=! setVariable "e"
+                          , setVariable "g" <=! setVariable "f"
+                          , setVariable "a" <=! setVariable "g"
+                          ]
 
+
+tc8 :: Assertion
+tc8 =
+  assertEqual "tc8" ([] :: [Int]) (sort sol)
+  where
+    Just solved = solveSystem cs
+    Just sol = leastSolution solved "zz"
+    cs = constraintSystem [ atom 5 <=! setVariable "b"
+                          , atom 6 <=! setVariable "b"
+                          , atom 7 <=! setVariable "a"
+                          , atom 8 <=! setVariable "a"
+                          , setVariable "b" <=! setVariable "a"
+                          , setVariable "c" <=! setVariable "b"
+                          , setVariable "d" <=! setVariable "c"
+                          , setVariable "e" <=! setVariable "d"
+                          , setVariable "f" <=! setVariable "e"
+                          , setVariable "g" <=! setVariable "f"
+                          , setVariable "a" <=! setVariable "g"
+                          , setVariable "z" <=! setVariable "f"
+                          , setVariable "zz" <=! setVariable "z"
+                          ]
+
+tc9 :: Assertion
+tc9 =
+  assertEqual "tc9" ([11] :: [Int]) (sort sol)
+  where
+    Just solved = solveSystem cs
+    Just sol = leastSolution solved "zz"
+    cs = constraintSystem [ atom 5 <=! setVariable "b"
+                          , atom 6 <=! setVariable "b"
+                          , atom 7 <=! setVariable "a"
+                          , atom 8 <=! setVariable "a"
+                          , setVariable "b" <=! setVariable "a"
+                          , setVariable "c" <=! setVariable "b"
+                          , setVariable "d" <=! setVariable "c"
+                          , setVariable "e" <=! setVariable "d"
+                          , setVariable "f" <=! setVariable "e"
+                          , setVariable "g" <=! setVariable "f"
+                          , setVariable "a" <=! setVariable "g"
+                          , setVariable "z" <=! setVariable "f"
+                          , setVariable "zz" <=! setVariable "z"
+                          , atom 11 <=! setVariable "zz"
+                          ]
+
+tc10 :: Assertion
+tc10 =
+  assertEqual "tc10" ([5, 6, 7, 8, 11] :: [Int]) (sort sol)
+  where
+    Just solved = solveSystem cs
+    Just sol = leastSolution solved "c"
+    cs = constraintSystem [ atom 5 <=! setVariable "b"
+                          , atom 6 <=! setVariable "b"
+                          , atom 7 <=! setVariable "a"
+                          , atom 8 <=! setVariable "a"
+                          , setVariable "b" <=! setVariable "a"
+                          , setVariable "c" <=! setVariable "b"
+                          , setVariable "d" <=! setVariable "c"
+                          , setVariable "e" <=! setVariable "d"
+                          , setVariable "f" <=! setVariable "e"
+                          , setVariable "g" <=! setVariable "f"
+                          , setVariable "a" <=! setVariable "g"
+                          , setVariable "z" <=! setVariable "f"
+                          , setVariable "zz" <=! setVariable "z"
+                          , atom 11 <=! setVariable "zz"
+                          ]
+
+-- There are no solutions to this type of constraint (A ⊆ c) when c is
+-- a nullary constructor (a constant term).  It can have solutions
+-- when c has arguments.
+tc11 :: Assertion
+tc11 =
+  assertEqual "tc11" ([] :: [Int]) (sort sol)
+  where
+    Just solved = solveSystem cs
+    Just sol = leastSolution solved "a"
+    cs = constraintSystem [ setVariable "a" <=! atom 5 ]
 
 
 main :: IO ()
