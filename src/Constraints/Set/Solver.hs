@@ -255,18 +255,18 @@ saturateGraph :: (Eq v, Eq c, Ord v, Ord c)
                  -> IFGraph v c
 saturateGraph m v g0 = closureEdges (S.fromList (nodes g0)) g0
   where
-    simplify a e =
+    simplify e a =
       let Just a' = simplifyInclusion e a
       in a'
     closureEdges ns g
       | S.null ns = g
       | otherwise =
         let nextEdges = F.foldl' (findEdge g) mempty ns
-        in case S.null nextEdges of
+            inclusions = F.foldl' simplify [] nextEdges
+        in case null inclusions of
           True -> g
           False ->
-            let inclusions = F.foldr simplify [] nextEdges
-                g' = foldr addToGraph g inclusions
+            let g' = foldr addToGraph g inclusions
                 affectedNodes = S.fromList (nodes g)
             in closureEdges affectedNodes g'
 
