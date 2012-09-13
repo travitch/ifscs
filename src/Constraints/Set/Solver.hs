@@ -267,7 +267,7 @@ saturateGraph m v g0 = closureEdges (S.fromList (nodes g0)) g0
           False ->
             let inclusions = F.foldr simplify [] nextEdges
                 g' = foldr addToGraph g inclusions
-                affectedNodes = S.fromList (nodes g) -- undefined inclusions
+                affectedNodes = S.fromList (nodes g)
             in closureEdges affectedNodes g'
 
     -- During optimization, modify this to compute affected nodes on

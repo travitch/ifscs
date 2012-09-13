@@ -11,13 +11,16 @@ tests :: [Test]
 tests = [
   testGroup "Simple" [
      testCase "tc1" tc1,
-     testCase "tc2" tc2
+     testCase "tc2" tc2,
+     testCase "tc3" tc3,
+     testCase "tc4" tc4,
+     testCase "tc5" tc5
      ]
   ]
 
 tc1 :: Assertion
 tc1 =
-  assertEqual "tc1" [5,6] (sort sol)
+  assertEqual "tc1" [5,6 :: Int] (sort sol)
   where
     Just solved = solveSystem cs
     Just sol = leastSolution solved "a"
@@ -25,11 +28,54 @@ tc1 =
 
 tc2 :: Assertion
 tc2 =
-  assertEqual "tc2" [5] (sort sol)
+  assertEqual "tc2" [5 :: Int] (sort sol)
   where
     Just solved = solveSystem cs
     Just sol = leastSolution solved "a"
     cs = constraintSystem [ atom 5 <=! setVariable "a", atom 6 <=! setVariable "b" ]
+
+tc3 :: Assertion
+tc3 =
+  assertEqual "tc3" [5, 6 :: Int] (sort sol)
+  where
+    Just solved = solveSystem cs
+    Just sol = leastSolution solved "a"
+    cs = constraintSystem [ atom 5 <=! setVariable "b"
+                          , atom 6 <=! setVariable "b"
+                          , setVariable "b" <=! setVariable "a"
+                          ]
+
+tc4 :: Assertion
+tc4 =
+  assertEqual "tc4" [0..20 :: Int] (sort sol)
+  where
+    Just solved = solveSystem cs
+    Just sol = leastSolution solved "a"
+    cs = constraintSystem $ map ((<=! setVariable "a") . atom) [0..20]
+
+-- From the FFSA98 paper
+tc5 :: Assertion
+tc5 =
+  assertEqual "tc5" [0..40 :: Int] (sort sol)
+  where
+    Just solved = solveSystem cs
+    Just sol = leastSolution solved "R1"
+    cs = constraintSystem $ concat [
+      [setVariable "Z" <=! setVariable "R1"
+      , setVariable "Z" <=! setVariable "R2"
+      , setVariable "Y1" <=! setVariable "Z"
+      , setVariable "Y2" <=! setVariable "Z"
+      , setVariable "X" <=! setVariable "Y1"
+      , setVariable "X" <=! setVariable "Y2"
+      , setVariable "L1" <=! setVariable "X"
+      , setVariable "L2" <=! setVariable "X"
+      ],
+      map ((<=! setVariable "L1") . atom) [0..20],
+      map ((<=! setVariable "L2") . atom) [20..40]
+      ]
+
+
+
 
 
 main :: IO ()
