@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleContexts, ScopedTypeVariables, DeriveDataTypeable #-}
 module Constraints.Set.Solver (
   ConstraintError(..),
+  Variance(..),
   Inclusion,
   SetExpression,
   ConstraintSystem,
@@ -9,6 +10,7 @@ module Constraints.Set.Solver (
   universalSet,
   setVariable,
   atom,
+  term,
   (<=!),
   constraintSystem,
   solveSystem,
@@ -51,8 +53,16 @@ universalSet = UniversalSet
 setVariable :: v -> SetExpression v c
 setVariable = SetVariable
 
+-- | Atomic terms have a label and arity zero.
 atom :: c -> SetExpression v c
-atom = Term
+atom conLabel = ConstructedTerm conLabel [] []
+
+-- | This returns a function to create terms from lists of
+-- SetExpressions.  It is meant to be partially applied so that as
+-- many terms as possible can share the same reference to a label and
+-- signature.
+term :: c -> [Variance] -> ([SetExpression v c] -> SetExpression v c)
+term = ConstructedTerm
 
 (<=!) :: SetExpression v c -> SetExpression v c -> Inclusion v c
 (<=!) = (:<=)
@@ -60,15 +70,13 @@ atom = Term
 constraintSystem :: [Inclusion v c] -> ConstraintSystem v c
 constraintSystem = ConstraintSystem
 
+data Variance = Covariant | Contravariant
+              deriving (Eq, Ord, Show)
+
 data SetExpression v c = EmptySet
                        | UniversalSet
                        | SetVariable v
-                       | Term c
-                         -- ^ A shorthand for a nullary constructed
-                         -- term for testing and development.  Replace
-                         -- with ConstructedTerm later.
-
-                         -- | ConstructedTerm conLabel [SetExpression] Signature
+                       | ConstructedTerm c [Variance] [SetExpression v c]
                        deriving (Eq, Ord, Show)
 
 data Inclusion v c = (SetExpression v c) :<= (SetExpression v c)
@@ -97,16 +105,29 @@ simplifyInclusion acc i =
       if v1 == v2 then return acc else return (i : acc)
     UniversalSet :<= EmptySet ->
       failure (NoSolution i)
-    Term t1 :<= Term t2 ->
-      if t1 == t2 then return acc else failure (NoSolution i)
-    UniversalSet :<= Term _ -> failure (NoSolution i)
-    Term _ :<= EmptySet -> failure (NoSolution i)
+    ConstructedTerm c1 s1 ses1 :<= ConstructedTerm c2 s2 ses2 ->
+      let sigLen = length s1
+          triples = zip3 s1 ses1 ses2
+      in case c1 == c2 && s1 == s2 && sigLen == length ses1 && sigLen == length ses2 of
+        False -> failure (NoSolution i)
+        True -> foldM simplifyWithVariance acc triples
+    UniversalSet :<= ConstructedTerm _ _ _ -> failure (NoSolution i)
+    ConstructedTerm _ _ _ :<= EmptySet -> failure (NoSolution i)
     -- Eliminate constraints of the form A ⊆ 1
     _ :<= UniversalSet -> return acc
     -- 0 ⊆ A
     EmptySet :<= _ -> return acc
     -- Keep anything else (atomic forms)
     _ -> return (i : acc)
+
+simplifyWithVariance :: (Failure (ConstraintError v c) m, Eq v, Eq c)
+                        => [Inclusion v c]
+                        -> (Variance, SetExpression v c, SetExpression v c)
+                        -> m [Inclusion v c]
+simplifyWithVariance acc (Covariant, se1, se2) =
+  simplifyInclusion acc (se1 :<= se2)
+simplifyWithVariance acc (Contravariant, se1, se2) =
+  simplifyInclusion acc (se2 :<= se1)
 
 simplifySystem :: (Failure (ConstraintError v c) m, Eq v, Eq c)
                   => ConstraintSystem v c
@@ -129,7 +150,7 @@ data SolvedSystem v c = SolvedSystem { systemIFGraph :: IFGraph v c
 --
 -- LS(y) = All source nodes with a predecessor edge to y, plus LS(x)
 -- for all x where x has a predecessor edge to y.
-leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c) => SolvedSystem v c -> v -> m [c]
+leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c) => SolvedSystem v c -> v -> m [SetExpression v c]
 leastSolution (SolvedSystem g m _) varLabel = do
   case M.lookup (SetVariable varLabel) m of
     Nothing -> failure ex
@@ -140,7 +161,7 @@ leastSolution (SolvedSystem g m _) varLabel = do
     -- For the given nid, add all of the predecessor terms (with a
     -- pred edge label) to the result set.  Recursively invoke go on
     -- any predecessors (With pred edge labels) that are variables.
-    go :: Int -> (Set Int, Set c) -> (Set Int, Set c)
+    go :: Int -> (Set Int, Set (SetExpression v c)) -> (Set Int, Set (SetExpression v c))
     go nid acc@(visited, res)
       | nid `S.member` visited = acc
       | otherwise =
@@ -149,12 +170,14 @@ leastSolution (SolvedSystem g m _) varLabel = do
             res' = foldr addTermPred res ps
             predVars = mapMaybe toPredVarId ps
         in foldr go (visited', res') predVars
-    addTermPred :: (Int, ConstraintEdge) -> Set c -> Set c
+
+    addTermPred :: (Int, ConstraintEdge) -> Set (SetExpression v c) -> Set (SetExpression v c)
     addTermPred (_, Succ) acc = acc
     addTermPred (nid, Pred) acc =
       case context g nid of
-        Just (Context _ (LNode _ (Term t)) _) -> S.insert t acc
+        Just (Context _ (LNode _ se@(ConstructedTerm _ _ _)) _) -> S.insert se acc
         _ -> acc
+
     toPredVarId :: (Int, ConstraintEdge) -> Maybe Int
     toPredVarId (_, Succ) = Nothing
     toPredVarId (nid, Pred) =
@@ -201,12 +224,18 @@ addInclusion i =
         EQ -> error "Constraints.Set.Solver.addInclusion: invalid A ⊆ A constraint"
         LT -> addEdge Pred e1 e2
         GT -> addEdge Succ e1 e2
-    e1@(Term _) :<= e2@(SetVariable _) -> addEdge Pred e1 e2
-    e1@(SetVariable _) :<= e2@(Term _) -> addEdge Succ e1 e2
+    e1@(ConstructedTerm _ _ _) :<= e2@(SetVariable _) -> addEdge Pred e1 e2
+    e1@(SetVariable _) :<= e2@(ConstructedTerm _ _ _) -> addEdge Succ e1 e2
     _ -> error "Constraints.Set.Solver.addInclusion: unexpected expression"
 
 -- | Add an edge in the constraint graph between the two expressions
 -- with the given label.  Adds nodes for the expressions if necessary.
+--
+-- FIXME: Instead of just returning a simple set here, we can return a
+-- set of pairs (edges) that we know will need to be added.  Adding
+-- those edges would then add more, &c.  This would save asymptotic
+-- work when re-visiting the source nodes (already visited nodes can
+-- be ignored).
 addEdge :: (Eq v, Eq c, Ord v, Ord c)
            => ConstraintEdge
            -> SetExpression v c

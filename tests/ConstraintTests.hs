@@ -163,11 +163,14 @@ tc11 = solveFor "tc11" "a" [] is
 
 solveFor :: String -> String -> [Int] -> [Inclusion String Int] -> Assertion
 solveFor name var expected is =
-  assertEqual name (sort expected) (sort sol)
+  assertEqual name (sort (map toSetExp expected)) (sort sol)
   where
     cs = constraintSystem is
     Just solved = solveSystem cs
     Just sol = leastSolution solved var
+
+toSetExp :: Int -> SetExpression v Int
+toSetExp i = term i [] []
 
 main :: IO ()
 main = defaultMain tests
