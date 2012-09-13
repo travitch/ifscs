@@ -1,4 +1,4 @@
-{-# LANGUAGE FlexibleContexts, ScopedTypeVariables #-}
+{-# LANGUAGE FlexibleContexts, ScopedTypeVariables, DeriveDataTypeable #-}
 module Constraints.Set.Solver (
   ConstraintError(..),
   Inclusion,
@@ -15,6 +15,7 @@ module Constraints.Set.Solver (
   leastSolution
   ) where
 
+import Control.Exception
 import Control.Failure
 import Control.Monad.State.Strict
 import qualified Data.Foldable as F
@@ -26,6 +27,7 @@ import Data.Maybe ( mapMaybe )
 import Data.Monoid
 import Data.Set ( Set )
 import qualified Data.Set as S
+import Data.Typeable
 import Data.Vector.Persistent ( Vector )
 import qualified Data.Vector.Persistent as V
 
@@ -79,7 +81,9 @@ data ConstraintSystem v c = ConstraintSystem [Inclusion v c]
 
 data ConstraintError v c = NoSolution (Inclusion v c)
                          | NoVariableLabel v
-                         deriving (Eq, Ord, Show)
+                         deriving (Eq, Ord, Show, Typeable)
+
+instance (Typeable v, Typeable c, Show v, Show c) => Exception (ConstraintError v c)
 
 -- | Simplify one set expression.
 simplifyInclusion :: (Failure (ConstraintError v c) m, Eq v, Eq c)
