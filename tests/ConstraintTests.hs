@@ -14,7 +14,8 @@ tests = [
      testCase "tc2" tc2,
      testCase "tc3" tc3,
      testCase "tc4" tc4,
-     testCase "tc5" tc5
+     testCase "tc5" tc5,
+     testCase "tc6" tc6
      ]
   ]
 
@@ -74,6 +75,20 @@ tc5 =
       map ((<=! setVariable "L2") . atom) [20..40]
       ]
 
+-- Test a simple cycle
+tc6 :: Assertion
+tc6 =
+  assertEqual "tc6" [5, 6, 7, 8 :: Int] (sort sol)
+  where
+    Just solved = solveSystem cs
+    Just sol = leastSolution solved "a"
+    cs = constraintSystem [ atom 5 <=! setVariable "b"
+                          , atom 6 <=! setVariable "b"
+                          , atom 7 <=! setVariable "a"
+                          , atom 8 <=! setVariable "a"
+                          , setVariable "b" <=! setVariable "a"
+                          , setVariable "a" <=! setVariable "b"
+                          ]
 
 
 
