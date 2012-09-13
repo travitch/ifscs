@@ -184,7 +184,10 @@ type BuilderMonad v c = State (IFGraph v c, Map (SetExpression v c) Int, Vector 
 buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c ()
 buildInitialGraph = mapM_ addInclusion
 
-addInclusion :: (Eq c, Ord v, Ord c) => Inclusion v c -> BuilderMonad v c ()
+-- | Adds an inclusion to the constraint graph (adding vertices if
+-- necessary).  Returns the set of nodes that are affected (and will
+-- need more transitive edges).
+addInclusion :: (Eq c, Ord v, Ord c) => Inclusion v c -> BuilderMonad v c (Set Int)
 addInclusion i =
   case i of
     -- This is the key to an inductive form graph (rather than
@@ -204,7 +207,7 @@ addEdge :: (Eq v, Eq c, Ord v, Ord c)
            => ConstraintEdge
            -> SetExpression v c
            -> SetExpression v c
-           -> BuilderMonad v c ()
+           -> BuilderMonad v c (Set Int)
 addEdge etype e1 e2 = do
   eid1 <- getEID e1
   eid2 <- getEID e2
@@ -212,6 +215,18 @@ addEdge etype e1 e2 = do
   (g, m, v) <- get
   let g' = insEdge edge g
   put (g', m, v)
+  -- If the edge we added is a predecessor edge, eid1 needs to be
+  -- scanned again later because new successors to eid2 might be
+  -- reachable.
+  --
+  -- Otherwise, all predecessors to eid1 (with Pred edge labels) need
+  -- to be scanned later.
+  case etype of
+    Pred -> return $ S.singleton eid1
+    Succ -> return $ foldr addPredPred mempty $ lpre g' eid1
+  where
+    addPredPred (_, Succ) s = s
+    addPredPred (pid, Pred) s = S.insert pid s
 
 -- | Get the ID for the expression node.  Inserts a new node into the
 -- graph if needed.
@@ -266,15 +281,15 @@ saturateGraph m v g0 = closureEdges (S.fromList (nodes g0)) g0
         in case null inclusions of
           True -> g
           False ->
-            let g' = foldr addToGraph g inclusions
-                affectedNodes = S.fromList (nodes g)
+            let (g', affectedNodes) = foldr addToGraph (g, mempty) inclusions
+--                affectedNodes = S.fromList (nodes g)
             in closureEdges affectedNodes g'
 
     -- During optimization, modify this to compute affected nodes on
     -- the fly
-    addToGraph i g =
-      let (g', _, _) = execState (addInclusion i) (g, m, v)
-      in g'
+    addToGraph i (g, affected) =
+      let (newAffected, (g', _, _)) = runState (addInclusion i) (g, m, v)
+      in (g', affected `S.union` newAffected)
 
     findEdge g s l =
       let xs = filter isPred $ lsuc g l
