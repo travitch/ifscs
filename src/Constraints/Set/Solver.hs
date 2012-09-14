@@ -23,9 +23,10 @@ import Control.Monad.State.Strict
 import qualified Data.Foldable as F
 import Data.Graph.Interface
 import Data.Graph.LazyHAMT
+import Data.Graph.Algorithms.Matching.DFS
 import Data.Map ( Map )
 import qualified Data.Map as M
-import Data.Maybe ( mapMaybe )
+import Data.Maybe ( catMaybes )
 import Data.Monoid
 import Data.Set ( Set )
 import qualified Data.Set as S
@@ -151,39 +152,18 @@ data SolvedSystem v c = SolvedSystem { systemIFGraph :: IFGraph v c
 -- LS(y) = All source nodes with a predecessor edge to y, plus LS(x)
 -- for all x where x has a predecessor edge to y.
 leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c) => SolvedSystem v c -> v -> m [SetExpression v c]
-leastSolution (SolvedSystem g m _) varLabel = do
+leastSolution (SolvedSystem g0 m _) varLabel = do
   case M.lookup (SetVariable varLabel) m of
     Nothing -> failure ex
-    Just nid -> return $ S.toList $ snd $ go nid (mempty, mempty)
+    Just nid -> return $ catMaybes $ xdfsWith pre' addTerm [nid] g0
   where
     ex :: ConstraintError v c
     ex = NoVariableLabel varLabel
-    -- For the given nid, add all of the predecessor terms (with a
-    -- pred edge label) to the result set.  Recursively invoke go on
-    -- any predecessors (With pred edge labels) that are variables.
-    go :: Int -> (Set Int, Set (SetExpression v c)) -> (Set Int, Set (SetExpression v c))
-    go nid acc@(visited, res)
-      | nid `S.member` visited = acc
-      | otherwise =
-        let visited' = S.insert nid visited
-            Just (Context ps _ _) = context g nid
-            res' = foldr addTermPred res ps
-            predVars = mapMaybe toPredVarId ps
-        in foldr go (visited', res') predVars
 
-    addTermPred :: (Int, ConstraintEdge) -> Set (SetExpression v c) -> Set (SetExpression v c)
-    addTermPred (_, Succ) acc = acc
-    addTermPred (nid, Pred) acc =
-      case context g nid of
-        Just (Context _ (LNode _ se@(ConstructedTerm _ _ _)) _) -> S.insert se acc
-        _ -> acc
-
-    toPredVarId :: (Int, ConstraintEdge) -> Maybe Int
-    toPredVarId (_, Succ) = Nothing
-    toPredVarId (nid, Pred) =
-      case context g nid of
-        Just (Context _ (LNode _ (SetVariable _)) _) -> Just nid
-        _ -> Nothing
+    -- We only want to add ConstructedTerms to the output list
+    addTerm :: Context (IFGraph v c) -> Maybe (SetExpression v c)
+    addTerm (Context _ (LNode _ se@(ConstructedTerm _ _ _)) _) = Just se
+    addTerm _ = Nothing
 
 solveSystem :: (Failure (ConstraintError v c) m, Eq c, Eq v, Ord c, Ord v)
                => ConstraintSystem v c
