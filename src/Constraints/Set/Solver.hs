@@ -80,6 +80,7 @@ data SetExpression v c = EmptySet
                        | ConstructedTerm c [Variance] [SetExpression v c]
                        deriving (Eq, Ord, Show)
 
+-- | An inclusion is a constraint of the form se1 ⊆ se2
 data Inclusion v c = (SetExpression v c) :<= (SetExpression v c)
                                  deriving (Eq, Ord, Show)
 
