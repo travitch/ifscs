@@ -24,6 +24,7 @@ import qualified Data.Foldable as F
 import Data.Graph.Interface
 import Data.Graph.LazyHAMT
 import Data.Graph.Algorithms.Matching.DFS
+import Data.List ( intercalate )
 import Data.Map ( Map )
 import qualified Data.Map as M
 import Data.Maybe ( catMaybes )
@@ -78,11 +79,24 @@ data SetExpression v c = EmptySet
                        | UniversalSet
                        | SetVariable v
                        | ConstructedTerm c [Variance] [SetExpression v c]
-                       deriving (Eq, Ord, Show)
+                       deriving (Eq, Ord)
+
+instance (Show v, Show c) => Show (SetExpression v c) where
+  show EmptySet = "∅"
+  show UniversalSet = "⦱"
+  show (SetVariable v) = show v
+  show (ConstructedTerm c _ es) =
+    concat [ show c, "("
+           , intercalate ", " (map show es)
+           , ")"
+           ]
 
 -- | An inclusion is a constraint of the form se1 ⊆ se2
 data Inclusion v c = (SetExpression v c) :<= (SetExpression v c)
-                                 deriving (Eq, Ord, Show)
+                                 deriving (Eq, Ord)
+
+instance (Show v, Show c) => Show (Inclusion v c) where
+  show (lhs :<= rhs) = concat [ show lhs, " ⊆ ", show rhs ]
 
 -- | A constraint system is a set of constraints in DNF.  The
 -- disjuncts are implicit.
