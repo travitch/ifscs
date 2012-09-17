@@ -250,6 +250,9 @@ pt2 = assertEqual "pt2" (sort [loc "x", loc "z"]) (sort sol)
          , setVariable "T10" <=! setVariable "TT"
          ]
 
+-- What if we take the above and add *pp = &zz; (make sure to just
+-- re-use T9).  Another important case, what about *pq = *pp;
+
 throwErr :: ConstraintError String String -> [SetExpression String String]
 throwErr = throw
 
