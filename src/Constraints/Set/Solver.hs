@@ -3,7 +3,7 @@ module Constraints.Set.Solver (
   ConstraintError(..),
   Variance(..),
   Inclusion,
-  SetExpression,
+  SetExpression(..),
   ConstraintSystem,
   SolvedSystem,
   emptySet,
@@ -152,7 +152,10 @@ data SolvedSystem v c = SolvedSystem { systemIFGraph :: IFGraph v c
 --
 -- LS(y) = All source nodes with a predecessor edge to y, plus LS(x)
 -- for all x where x has a predecessor edge to y.
-leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c) => SolvedSystem v c -> v -> m [SetExpression v c]
+leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c)
+                 => SolvedSystem v c
+                 -> v
+                 -> m [SetExpression v c]
 leastSolution (SolvedSystem g0 m _) varLabel = do
   case M.lookup (SetVariable varLabel) m of
     Nothing -> failure ex
