@@ -14,7 +14,10 @@ module Constraints.Set.Solver (
   (<=!),
   constraintSystem,
   solveSystem,
-  leastSolution
+  leastSolution,
+  -- * Debugging
+  ConstraintEdge(..),
+  solvedSystemGraphElems
   ) where
 
 import Control.Exception
@@ -83,7 +86,7 @@ data SetExpression v c = EmptySet
 
 instance (Show v, Show c) => Show (SetExpression v c) where
   show EmptySet = "∅"
-  show UniversalSet = "⦱"
+  show UniversalSet = "U"
   show (SetVariable v) = show v
   show (ConstructedTerm c _ es) =
     concat [ show c, "("
@@ -162,6 +165,7 @@ data SolvedSystem v c = SolvedSystem { systemIFGraph :: IFGraph v c
                                      , systemIdToSetMap :: Vector (SetExpression v c)
                                      }
 
+
 -- | Compute the least solution for the given variable
 --
 -- LS(y) = All source nodes with a predecessor edge to y, plus LS(x)
@@ -192,38 +196,43 @@ solveSystem s = do
 
 constraintsToIFGraph :: (Ord v, Ord c) => ConstraintSystem v c -> SolvedSystem v c
 constraintsToIFGraph (ConstraintSystem is) =
-  SolvedSystem { systemIFGraph = saturateGraph m v g0
+  SolvedSystem { systemIFGraph = g
                , systemSetToIdMap = m
                , systemIdToSetMap = v
                }
   where
     -- The initial graph has all of the nodes we need; after that we
     -- just need to saturate the edges through transitive closure
-    (g0, m, v) = execState (buildInitialGraph is) (empty, mempty, mempty)
+    (g, (m, v)) = runState (buildInitialGraph is >>= saturateGraph) (mempty, mempty)
 
-type BuilderMonad v c = State (IFGraph v c, Map (SetExpression v c) Int, Vector (SetExpression v c))
+type BuilderMonad v c = State (Map (SetExpression v c) Int, Vector (SetExpression v c))
 
 -- | Build an initial IF constraint graph that contains all of the
 -- vertices and the edges induced by the initial simplified constraint
 -- system.
-buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c ()
-buildInitialGraph = mapM_ addInclusion
+buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c (IFGraph v c)
+buildInitialGraph is = do
+  res <- foldM addInclusion (empty, mempty) is
+  return (fst res)
 
 -- | Adds an inclusion to the constraint graph (adding vertices if
 -- necessary).  Returns the set of nodes that are affected (and will
 -- need more transitive edges).
-addInclusion :: (Eq c, Ord v, Ord c) => Inclusion v c -> BuilderMonad v c (Set Int)
-addInclusion i =
+addInclusion :: (Eq c, Ord v, Ord c)
+                => (IFGraph v c, Set Int)
+                -> Inclusion v c
+                -> BuilderMonad v c (IFGraph v c, Set Int)
+addInclusion acc i =
   case i of
     -- This is the key to an inductive form graph (rather than
     -- standard form)
     e1@(SetVariable v1) :<= e2@(SetVariable v2) ->
       case compare v1 v2 of
         EQ -> error "Constraints.Set.Solver.addInclusion: invalid A ⊆ A constraint"
-        LT -> addEdge Pred e1 e2
-        GT -> addEdge Succ e1 e2
-    e1@(ConstructedTerm _ _ _) :<= e2@(SetVariable _) -> addEdge Pred e1 e2
-    e1@(SetVariable _) :<= e2@(ConstructedTerm _ _ _) -> addEdge Succ e1 e2
+        LT -> addEdge acc Pred e1 e2
+        GT -> addEdge acc Succ e1 e2
+    e1@(ConstructedTerm _ _ _) :<= e2@(SetVariable _) -> addEdge acc Pred e1 e2
+    e1@(SetVariable _) :<= e2@(ConstructedTerm _ _ _) -> addEdge acc Succ e1 e2
     _ -> error "Constraints.Set.Solver.addInclusion: unexpected expression"
 
 -- | Add an edge in the constraint graph between the two expressions
@@ -235,17 +244,17 @@ addInclusion i =
 -- work when re-visiting the source nodes (already visited nodes can
 -- be ignored).
 addEdge :: (Eq v, Eq c, Ord v, Ord c)
-           => ConstraintEdge
+           => (IFGraph v c, Set Int)
+           -> ConstraintEdge
            -> SetExpression v c
            -> SetExpression v c
-           -> BuilderMonad v c (Set Int)
-addEdge etype e1 e2 = do
-  eid1 <- getEID e1
-  eid2 <- getEID e2
+           -> BuilderMonad v c (IFGraph v c, Set Int)
+addEdge (g0, affected) etype e1 e2 = do
+  (eid1, g1) <- getEID e1 g0
+  (eid2, g2) <- getEID e2 g1
   let edge = LEdge (Edge eid1 eid2) etype
-  (g, m, v) <- get
-  let g' = insEdge edge g
-  put (g', m, v)
+      g3 = insEdge edge g2
+
   -- If the edge we added is a predecessor edge, eid1 needs to be
   -- scanned again later because new successors to eid2 might be
   -- reachable.
@@ -253,26 +262,29 @@ addEdge etype e1 e2 = do
   -- Otherwise, all predecessors to eid1 (with Pred edge labels) need
   -- to be scanned later.
   case etype of
-    Pred -> return $ S.singleton eid1
-    Succ -> return $ foldr addPredPred mempty $ lpre g' eid1
+    Pred -> return $ (g3, S.insert eid1 affected)
+    Succ -> return $ (g3, foldr addPredPred affected $ lpre g3 eid1)
   where
     addPredPred (_, Succ) s = s
     addPredPred (pid, Pred) s = S.insert pid s
 
 -- | Get the ID for the expression node.  Inserts a new node into the
 -- graph if needed.
-getEID :: (Ord v, Ord c) => SetExpression v c -> BuilderMonad v c Int
-getEID e = do
-  (g, m, v) <- get
+getEID :: (Ord v, Ord c)
+          => SetExpression v c
+          -> IFGraph v c
+          -> BuilderMonad v c (Int, IFGraph v c)
+getEID e g = do
+  (m, v) <- get
   case M.lookup e m of
-    Just i -> return i
+    Just i -> return (i, g)
     Nothing -> do
       let eid = V.length v
           v' = V.snoc v e
           m' = M.insert e eid m
           g' = insNode (LNode eid e) g
-      put (g', m', v')
-      return eid
+      put (m', v')
+      return (eid, g')
 
 -- | For each node L in the graph, follow its predecessor edges to
 -- obtain set X.  For each ndoe in X, follow its successor edges
@@ -295,39 +307,32 @@ getEID e = do
 -- implies that no solution is possible.  I think that probably
 -- shouldn't ever happen but I have no proof.
 saturateGraph :: (Eq v, Eq c, Ord v, Ord c)
-                 => Map (SetExpression v c) Int
-                 -> Vector (SetExpression v c)
-                 -> IFGraph v c
-                 -> IFGraph v c
-saturateGraph m v g0 = closureEdges (S.fromList (nodes g0)) g0
+                 => IFGraph v c
+                 -> BuilderMonad v c (IFGraph v c)
+saturateGraph g0 = closureEdges (S.fromList (nodes g0)) g0
   where
     simplify e a =
       let Just a' = simplifyInclusion e a
       in a'
     closureEdges ns g
-      | S.null ns = g
-      | otherwise =
-        let nextEdges = F.foldl' (findEdge g) mempty ns
+      | S.null ns = return g
+      | otherwise = do
+        (_, v) <- get
+        let nextEdges = F.foldl' (findEdge v g) mempty ns
             inclusions = F.foldl' simplify [] nextEdges
-        in case null inclusions of
-          True -> g
-          False ->
-            let (g', affectedNodes) = foldr addToGraph (g, mempty) inclusions
+        case null inclusions of
+          True -> return g
+          False -> do
+            (g', affectedNodes) <- foldM addInclusion (g, mempty) inclusions
 --                affectedNodes = S.fromList (nodes g)
-            in closureEdges affectedNodes g'
+            closureEdges affectedNodes g'
 
-    -- During optimization, modify this to compute affected nodes on
-    -- the fly
-    addToGraph i (g, affected) =
-      let (newAffected, (g', _, _)) = runState (addInclusion i) (g, m, v)
-      in (g', affected `S.union` newAffected)
-
-    findEdge g s l =
+    findEdge v g s l =
       let xs = filter isPred $ lsuc g l
           rs = filter isSucc $ concatMap (lsuc g . fst) xs
-      in foldr (toNewInclusion g l . fst) s rs
+      in foldr (toNewInclusion v g l . fst) s rs
 
-    toNewInclusion g l r s =
+    toNewInclusion v g l r s =
       case edgeExists g (Edge l r) of
         Just _ -> s
         Nothing -> S.insert (V.unsafeIndex v l :<= V.unsafeIndex v r) s
@@ -337,3 +342,10 @@ isPred = (==Pred) . snd
 
 isSucc :: (Node (IFGraph v s), EdgeLabel (IFGraph v s)) -> Bool
 isSucc = (==Succ) . snd
+
+
+solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
+solvedSystemGraphElems (SolvedSystem g _ _) = (ns, es)
+  where
+    ns = map (\(LNode nid l) -> (nid, l)) $ labNodes g
+    es = map (\(LEdge (Edge s d) l) -> (s, d, l)) $ labEdges g
