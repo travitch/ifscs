@@ -19,6 +19,7 @@ library
                  hbgl, persistent-vector
   hs-source-dirs: src
   ghc-options: -Wall
+  ghc-prof-options: -auto-all
 
 test-suite ConstraintTests
   default-language: Haskell2010
