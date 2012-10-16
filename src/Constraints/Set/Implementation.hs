@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleContexts, ScopedTypeVariables, DeriveDataTypeable #-}
+{-# LANGUAGE BangPatterns #-}
 module Constraints.Set.Implementation (
   ConstraintError(..),
   Variance(..),
@@ -249,11 +250,11 @@ addEdge :: (Eq v, Eq c, Ord v, Ord c)
            -> SetExpression v c
            -> SetExpression v c
            -> BuilderMonad v c (IFGraph v c, Set Int)
-addEdge (g0, affected) etype e1 e2 = do
+addEdge (!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
   let edge = LEdge (Edge eid1 eid2) etype
-      g3 = insEdge edge g2
+      !g3 = insEdge edge g2
 
   -- If the edge we added is a predecessor edge, eid1 needs to be
   -- scanned again later because new successors to eid2 might be
@@ -265,8 +266,8 @@ addEdge (g0, affected) etype e1 e2 = do
     Pred -> return $ (g3, S.insert eid1 affected)
     Succ -> return $ (g3, foldr addPredPred affected $ lpre g3 eid1)
   where
-    addPredPred (_, Succ) s = s
-    addPredPred (pid, Pred) s = S.insert pid s
+    addPredPred (_, Succ) !s = s
+    addPredPred (pid, Pred) !s = S.insert pid s
 
 -- | Get the ID for the expression node.  Inserts a new node into the
 -- graph if needed.
