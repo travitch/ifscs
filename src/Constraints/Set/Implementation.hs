@@ -32,7 +32,7 @@ import Data.Hashable
 import Data.List ( intercalate )
 import Data.Map ( Map )
 import qualified Data.Map as M
-import Data.Maybe ( catMaybes )
+import Data.Maybe ( catMaybes, mapMaybe )
 import Data.Monoid
 import Data.Set ( Set )
 import qualified Data.Set as S
@@ -236,13 +236,16 @@ buildInitialGraph is = do
   res <- foldM addInclusion (CG.emptyGraph, mempty) is
   return (fst res)
 
+data PredSegment = PS {-# UNPACK #-} !Int {-# UNPACK #-} !Int
+                 deriving (Eq, Ord)
+
 -- | Adds an inclusion to the constraint graph (adding vertices if
 -- necessary).  Returns the set of nodes that are affected (and will
 -- need more transitive edges).
 addInclusion :: (Eq c, Ord v, Ord c)
-                => (IFGraph, Set Int)
+                => (IFGraph, Set PredSegment)
                 -> Inclusion v c
-                -> BuilderMonad v c (IFGraph, Set Int)
+                -> BuilderMonad v c (IFGraph, Set PredSegment)
 addInclusion acc i =
   case i of
     -- This is the key to an inductive form graph (rather than
@@ -267,11 +270,11 @@ addInclusion acc i =
 -- work when re-visiting the source nodes (already visited nodes can
 -- be ignored).
 addEdge :: (Eq v, Eq c, Ord v, Ord c)
-           => (IFGraph, Set Int)
+           => (IFGraph, Set PredSegment)
            -> ConstraintEdge
            -> SetExpression v c
            -> SetExpression v c
-           -> BuilderMonad v c (IFGraph, Set Int)
+           -> BuilderMonad v c (IFGraph, Set PredSegment)
 addEdge (!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
@@ -284,11 +287,11 @@ addEdge (!g0, !affected) etype e1 e2 = do
   -- Otherwise, all predecessors to eid1 (with Pred edge labels) need
   -- to be scanned later.
   case etype of
-    Pred -> return $ (g3, S.insert eid1 affected)
-    Succ -> return $ (g3, CG.foldlPred addPredPred affected g3 eid1)
+    Pred -> return $ (g3, S.insert (PS eid1 eid2) affected)
+    Succ -> return $ (g3, CG.foldlPred (addPredPred eid1) affected g3 eid1)
   where
-    addPredPred acc _ Succ = acc
-    addPredPred acc pid Pred = S.insert pid acc
+    addPredPred _ acc _ Succ = acc
+    addPredPred eid1 acc pid Pred = S.insert (PS pid eid1) acc
 
 -- | Get the ID for the expression node.  Inserts a new node into the
 -- graph if needed.
@@ -331,8 +334,14 @@ getEID e g = do
 saturateGraph :: (Eq v, Eq c, Ord v, Ord c)
                  => IFGraph
                  -> BuilderMonad v c IFGraph
-saturateGraph g0 = closureEdges (S.fromList (CG.nodes g0)) g0
+saturateGraph g0 = closureEdges es0 g0
   where
+    -- Initialize the saturation worklist with all of the predecessor
+    -- edges in the initial graph
+    es0 = S.fromList $ mapMaybe predToPredSeg $ CG.graphEdges g0
+    predToPredSeg (l, r, Pred) = return $ PS l r
+    predToPredSeg _ = Nothing
+
     simplify v e (IE l r) =
       let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
           Just incl' = simplifyInclusion e incl
@@ -347,15 +356,13 @@ saturateGraph g0 = closureEdges (S.fromList (CG.nodes g0)) g0
           True -> return g
           False -> do
             (g', affectedNodes) <- foldM addInclusion (g, mempty) inclusions
---                affectedNodes = S.fromList (nodes g)
             closureEdges affectedNodes g'
 
-    findEdge g s l =
-      let xs = CG.foldlSucc predEdgeF [] g l
-          rs = F.foldl' (\acc x -> CG.foldlSucc succEdgeF acc g x) [] xs
+    findEdge g s (PS l x) =
+      let rs = CG.foldlSucc succEdgeF [] g x
       in foldr (toNewInclusion g l) s rs
 
-    toNewInclusion g !l !r !s =
+    toNewInclusion g l r !s =
       case CG.edgeExists g l r of
         True -> s
         False -> HS.insert (IE l r) s
