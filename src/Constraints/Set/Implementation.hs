@@ -159,9 +159,9 @@ simplifySystem (ConstraintSystem is) = do
 data ConstraintEdge = Succ | Pred
                     deriving (Eq, Ord, Show)
 
-type IFGraph v c = Gr (SetExpression v c) ConstraintEdge
+type IFGraph = Gr () ConstraintEdge
 
-data SolvedSystem v c = SolvedSystem { systemIFGraph :: IFGraph v c
+data SolvedSystem v c = SolvedSystem { systemIFGraph :: IFGraph
                                      , systemSetToIdMap :: Map (SetExpression v c) Int
                                      , systemIdToSetMap :: Vector (SetExpression v c)
                                      }
@@ -175,7 +175,7 @@ leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c)
                  => SolvedSystem v c
                  -> v
                  -> m [SetExpression v c]
-leastSolution (SolvedSystem g0 m _) varLabel = do
+leastSolution (SolvedSystem g0 m v) varLabel = do
   case M.lookup (SetVariable varLabel) m of
     Nothing -> failure ex
     Just nid -> return $ catMaybes $ xdfsWith pre' addTerm [nid] g0
@@ -184,9 +184,12 @@ leastSolution (SolvedSystem g0 m _) varLabel = do
     ex = NoVariableLabel varLabel
 
     -- We only want to add ConstructedTerms to the output list
-    addTerm :: Context (IFGraph v c) -> Maybe (SetExpression v c)
-    addTerm (Context _ (LNode _ se@(ConstructedTerm _ _ _)) _) = Just se
-    addTerm _ = Nothing
+    addTerm :: Context IFGraph -> Maybe (SetExpression v c)
+    addTerm (Context _ (LNode nid _) _) = do
+      se <- V.index v nid
+      case se of
+        ConstructedTerm _ _ _ -> return se
+        _ -> Nothing
 
 solveSystem :: (Failure (ConstraintError v c) m, Eq c, Eq v, Ord c, Ord v)
                => ConstraintSystem v c
@@ -211,7 +214,7 @@ type BuilderMonad v c = State (Map (SetExpression v c) Int, Vector (SetExpressio
 -- | Build an initial IF constraint graph that contains all of the
 -- vertices and the edges induced by the initial simplified constraint
 -- system.
-buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c (IFGraph v c)
+buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c IFGraph
 buildInitialGraph is = do
   res <- foldM addInclusion (empty, mempty) is
   return (fst res)
@@ -220,9 +223,9 @@ buildInitialGraph is = do
 -- necessary).  Returns the set of nodes that are affected (and will
 -- need more transitive edges).
 addInclusion :: (Eq c, Ord v, Ord c)
-                => (IFGraph v c, Set Int)
+                => (IFGraph, Set Int)
                 -> Inclusion v c
-                -> BuilderMonad v c (IFGraph v c, Set Int)
+                -> BuilderMonad v c (IFGraph, Set Int)
 addInclusion acc i =
   case i of
     -- This is the key to an inductive form graph (rather than
@@ -245,11 +248,11 @@ addInclusion acc i =
 -- work when re-visiting the source nodes (already visited nodes can
 -- be ignored).
 addEdge :: (Eq v, Eq c, Ord v, Ord c)
-           => (IFGraph v c, Set Int)
+           => (IFGraph, Set Int)
            -> ConstraintEdge
            -> SetExpression v c
            -> SetExpression v c
-           -> BuilderMonad v c (IFGraph v c, Set Int)
+           -> BuilderMonad v c (IFGraph, Set Int)
 addEdge (!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
@@ -273,17 +276,17 @@ addEdge (!g0, !affected) etype e1 e2 = do
 -- graph if needed.
 getEID :: (Ord v, Ord c)
           => SetExpression v c
-          -> IFGraph v c
-          -> BuilderMonad v c (Int, IFGraph v c)
+          -> IFGraph
+          -> BuilderMonad v c (Int, IFGraph)
 getEID e g = do
   (m, v) <- get
   case M.lookup e m of
     Just i -> return (i, g)
     Nothing -> do
       let eid = V.length v
-          v' = V.snoc v e
-          m' = M.insert e eid m
-          g' = insNode (LNode eid e) g
+          !v' = V.snoc v e
+          !m' = M.insert e eid m
+          !g' = insNode (LNode eid ()) {- e) -} g
       put (m', v')
       return (eid, g')
 
@@ -308,8 +311,8 @@ getEID e g = do
 -- implies that no solution is possible.  I think that probably
 -- shouldn't ever happen but I have no proof.
 saturateGraph :: (Eq v, Eq c, Ord v, Ord c)
-                 => IFGraph v c
-                 -> BuilderMonad v c (IFGraph v c)
+                 => IFGraph
+                 -> BuilderMonad v c IFGraph
 saturateGraph g0 = closureEdges (S.fromList (nodes g0)) g0
   where
     simplify e a =
@@ -338,15 +341,15 @@ saturateGraph g0 = closureEdges (S.fromList (nodes g0)) g0
         Just _ -> s
         Nothing -> S.insert (V.unsafeIndex v l :<= V.unsafeIndex v r) s
 
-isPred :: (Node (IFGraph v s), EdgeLabel (IFGraph v s)) -> Bool
+isPred :: (Node IFGraph, EdgeLabel IFGraph) -> Bool
 isPred = (==Pred) . snd
 
-isSucc :: (Node (IFGraph v s), EdgeLabel (IFGraph v s)) -> Bool
+isSucc :: (Node IFGraph, EdgeLabel IFGraph) -> Bool
 isSucc = (==Succ) . snd
 
 
 solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
-solvedSystemGraphElems (SolvedSystem g _ _) = (ns, es)
+solvedSystemGraphElems (SolvedSystem g _ v) = (ns, es)
   where
-    ns = map (\(LNode nid l) -> (nid, l)) $ labNodes g
+    ns = map (\(LNode nid _) -> (nid, V.unsafeIndex v nid)) $ labNodes g
     es = map (\(LEdge (Edge s d) l) -> (s, d, l)) $ labEdges g
