@@ -28,6 +28,7 @@ import qualified Data.Foldable as F
 import qualified Data.Graph.Interface as G
 import qualified Data.Graph.LazyHAMT as HAMT
 import Data.Graph.Algorithms.Matching.DFS
+import Data.Hashable
 import Data.List ( intercalate )
 import Data.Map ( Map )
 import qualified Data.Map as M
@@ -332,7 +333,7 @@ saturateGraph :: (Eq v, Eq c, Ord v, Ord c)
                  -> BuilderMonad v c IFGraph
 saturateGraph g0 = closureEdges (S.fromList (CG.nodes g0)) g0
   where
-    simplify v e (l, r) =
+    simplify v e (IE l r) =
       let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
           Just incl' = simplifyInclusion e incl
       in incl'
@@ -354,10 +355,16 @@ saturateGraph g0 = closureEdges (S.fromList (CG.nodes g0)) g0
           rs = F.foldl' (\acc x -> CG.foldlSucc succEdgeF acc g x) [] xs
       in foldr (toNewInclusion g l) s rs
 
-    toNewInclusion g l r !s =
+    toNewInclusion g !l !r !s =
       case CG.edgeExists g l r of
         True -> s
-        False -> HS.insert (l, r) s
+        False -> HS.insert (IE l r) s
+
+data InclusionEndpoints = IE {-# UNPACK #-} !Int {-# UNPACK #-} !Int
+                        deriving (Eq)
+
+instance Hashable InclusionEndpoints where
+  hash (IE l r) = l `combine` r
 
 predEdgeF :: [Int] -> Int -> ConstraintEdge -> [Int]
 predEdgeF acc _ Succ = acc
