@@ -286,7 +286,7 @@ getEID e g = do
       let eid = V.length v
           !v' = V.snoc v e
           !m' = M.insert e eid m
-          !g' = insNode (LNode eid ()) {- e) -} g
+          !g' = insNode (LNode eid ()) g
       put (m', v')
       return (eid, g')
 
@@ -315,15 +315,16 @@ saturateGraph :: (Eq v, Eq c, Ord v, Ord c)
                  -> BuilderMonad v c IFGraph
 saturateGraph g0 = closureEdges (S.fromList (nodes g0)) g0
   where
-    simplify e a =
-      let Just a' = simplifyInclusion e a
-      in a'
+    simplify v e (l, r) =
+      let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
+          Just incl' = simplifyInclusion e incl
+      in incl'
     closureEdges ns g
       | S.null ns = return g
       | otherwise = do
         (_, v) <- get
-        let nextEdges = F.foldl' (findEdge v g) mempty ns
-            inclusions = F.foldl' simplify [] nextEdges
+        let nextEdges = F.foldl' (findEdge g) mempty ns
+            inclusions = F.foldl' (simplify v) [] nextEdges
         case null inclusions of
           True -> return g
           False -> do
@@ -331,15 +332,15 @@ saturateGraph g0 = closureEdges (S.fromList (nodes g0)) g0
 --                affectedNodes = S.fromList (nodes g)
             closureEdges affectedNodes g'
 
-    findEdge v g s l =
+    findEdge g s l =
       let xs = filter isPred $ lsuc g l
           rs = filter isSucc $ concatMap (lsuc g . fst) xs
-      in foldr (toNewInclusion v g l . fst) s rs
+      in foldr (toNewInclusion g l . fst) s rs
 
-    toNewInclusion v g l r s =
+    toNewInclusion g l r !s =
       case edgeExists g (Edge l r) of
         Just _ -> s
-        Nothing -> S.insert (V.unsafeIndex v l :<= V.unsafeIndex v r) s
+        Nothing -> S.insert (l, r) s
 
 isPred :: (Node IFGraph, EdgeLabel IFGraph) -> Bool
 isPred = (==Pred) . snd
