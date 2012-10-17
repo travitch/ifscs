@@ -13,10 +13,11 @@ cabal-version:       >=1.10
 library
   default-language: Haskell2010
   exposed-modules: Constraints.Set.Solver,
-                   Constraints.Set.Internal
+                   Constraints.Set.Internal,
+                   Constraints.Set.ConstraintGraph
   other-modules: Constraints.Set.Implementation
   build-depends: base == 4.*, failure, mtl > 2, containers,
-                 hbgl, persistent-vector
+                 hbgl, persistent-vector, unordered-containers
   hs-source-dirs: src
   ghc-options: -Wall
   ghc-prof-options: -auto-all

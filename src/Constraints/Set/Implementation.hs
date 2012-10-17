@@ -25,8 +25,8 @@ import Control.Exception
 import Control.Failure
 import Control.Monad.State.Strict
 import qualified Data.Foldable as F
-import Data.Graph.Interface
-import Data.Graph.LazyHAMT
+import qualified Data.Graph.Interface as G
+import qualified Data.Graph.LazyHAMT as HAMT
 import Data.Graph.Algorithms.Matching.DFS
 import Data.List ( intercalate )
 import Data.Map ( Map )
@@ -35,9 +35,22 @@ import Data.Maybe ( catMaybes )
 import Data.Monoid
 import Data.Set ( Set )
 import qualified Data.Set as S
+import qualified Data.HashSet as HS
 import Data.Typeable
 import Data.Vector.Persistent ( Vector )
 import qualified Data.Vector.Persistent as V
+
+import qualified Constraints.Set.ConstraintGraph as CG
+
+-- FIXME: Build up a mutable graph (in ST) with an efficient edge
+-- existence test and then convert to a LazyHAMT afterward.
+--
+-- Also, see about reducing the actual graph to be over Ints instead
+-- of requiring complex comparisons (compare is taking 25% of the
+-- runtime).
+--
+-- It shouldn't be necessary to keep node labels at all; just their
+-- ids.  The saturation process never references them
 
 -- 1) Take the list of initial constraints and simplify them using the
 -- rewrite rules.  Once they are solved, all constraints are in
@@ -159,9 +172,10 @@ simplifySystem (ConstraintSystem is) = do
 data ConstraintEdge = Succ | Pred
                     deriving (Eq, Ord, Show)
 
-type IFGraph = Gr () ConstraintEdge
+type IFGraph = CG.Graph ConstraintEdge
+type SolvedGraph = HAMT.Gr () ConstraintEdge
 
-data SolvedSystem v c = SolvedSystem { systemIFGraph :: IFGraph
+data SolvedSystem v c = SolvedSystem { systemIFGraph :: SolvedGraph
                                      , systemSetToIdMap :: Map (SetExpression v c) Int
                                      , systemIdToSetMap :: Vector (SetExpression v c)
                                      }
@@ -178,14 +192,14 @@ leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c)
 leastSolution (SolvedSystem g0 m v) varLabel = do
   case M.lookup (SetVariable varLabel) m of
     Nothing -> failure ex
-    Just nid -> return $ catMaybes $ xdfsWith pre' addTerm [nid] g0
+    Just nid -> return $ catMaybes $ xdfsWith G.pre' addTerm [nid] g0
   where
     ex :: ConstraintError v c
     ex = NoVariableLabel varLabel
 
     -- We only want to add ConstructedTerms to the output list
-    addTerm :: Context IFGraph -> Maybe (SetExpression v c)
-    addTerm (Context _ (LNode nid _) _) = do
+    addTerm :: G.Context SolvedGraph -> Maybe (SetExpression v c)
+    addTerm (G.Context _ (G.LNode nid _) _) = do
       se <- V.index v nid
       case se of
         ConstructedTerm _ _ _ -> return se
@@ -200,7 +214,7 @@ solveSystem s = do
 
 constraintsToIFGraph :: (Ord v, Ord c) => ConstraintSystem v c -> SolvedSystem v c
 constraintsToIFGraph (ConstraintSystem is) =
-  SolvedSystem { systemIFGraph = g
+  SolvedSystem { systemIFGraph = G.mkGraph ns es
                , systemSetToIdMap = m
                , systemIdToSetMap = v
                }
@@ -208,6 +222,8 @@ constraintsToIFGraph (ConstraintSystem is) =
     -- The initial graph has all of the nodes we need; after that we
     -- just need to saturate the edges through transitive closure
     (g, (m, v)) = runState (buildInitialGraph is >>= saturateGraph) (mempty, mempty)
+    ns = map (\(nid, _) -> G.LNode nid ()) $ CG.graphNodes g
+    es = map (\(s,d,l) -> G.LEdge (G.Edge s d) l) $ CG.graphEdges g
 
 type BuilderMonad v c = State (Map (SetExpression v c) Int, Vector (SetExpression v c))
 
@@ -216,7 +232,7 @@ type BuilderMonad v c = State (Map (SetExpression v c) Int, Vector (SetExpressio
 -- system.
 buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c IFGraph
 buildInitialGraph is = do
-  res <- foldM addInclusion (empty, mempty) is
+  res <- foldM addInclusion (CG.emptyGraph, mempty) is
   return (fst res)
 
 -- | Adds an inclusion to the constraint graph (adding vertices if
@@ -235,8 +251,10 @@ addInclusion acc i =
         EQ -> error "Constraints.Set.Solver.addInclusion: invalid A ⊆ A constraint"
         LT -> addEdge acc Pred e1 e2
         GT -> addEdge acc Succ e1 e2
-    e1@(ConstructedTerm _ _ _) :<= e2@(SetVariable _) -> addEdge acc Pred e1 e2
-    e1@(SetVariable _) :<= e2@(ConstructedTerm _ _ _) -> addEdge acc Succ e1 e2
+    e1@(ConstructedTerm _ _ _) :<= e2@(SetVariable _) ->
+      addEdge acc Pred e1 e2
+    e1@(SetVariable _) :<= e2@(ConstructedTerm _ _ _) ->
+      addEdge acc Succ e1 e2
     _ -> error "Constraints.Set.Solver.addInclusion: unexpected expression"
 
 -- | Add an edge in the constraint graph between the two expressions
@@ -256,8 +274,7 @@ addEdge :: (Eq v, Eq c, Ord v, Ord c)
 addEdge (!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
-  let edge = LEdge (Edge eid1 eid2) etype
-      !g3 = insEdge edge g2
+  let !g3 = CG.insEdge eid1 eid2 etype g2
 
   -- If the edge we added is a predecessor edge, eid1 needs to be
   -- scanned again later because new successors to eid2 might be
@@ -267,10 +284,10 @@ addEdge (!g0, !affected) etype e1 e2 = do
   -- to be scanned later.
   case etype of
     Pred -> return $ (g3, S.insert eid1 affected)
-    Succ -> return $ (g3, foldr addPredPred affected $ lpre g3 eid1)
+    Succ -> return $ (g3, CG.foldlPred addPredPred affected g3 eid1)
   where
-    addPredPred (_, Succ) !s = s
-    addPredPred (pid, Pred) !s = S.insert pid s
+    addPredPred acc _ Succ = acc
+    addPredPred acc pid Pred = S.insert pid acc
 
 -- | Get the ID for the expression node.  Inserts a new node into the
 -- graph if needed.
@@ -286,7 +303,7 @@ getEID e g = do
       let eid = V.length v
           !v' = V.snoc v e
           !m' = M.insert e eid m
-          !g' = insNode (LNode eid ()) g
+          !g' = CG.insNode eid g
       put (m', v')
       return (eid, g')
 
@@ -313,7 +330,7 @@ getEID e g = do
 saturateGraph :: (Eq v, Eq c, Ord v, Ord c)
                  => IFGraph
                  -> BuilderMonad v c IFGraph
-saturateGraph g0 = closureEdges (S.fromList (nodes g0)) g0
+saturateGraph g0 = closureEdges (S.fromList (CG.nodes g0)) g0
   where
     simplify v e (l, r) =
       let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
@@ -333,24 +350,25 @@ saturateGraph g0 = closureEdges (S.fromList (nodes g0)) g0
             closureEdges affectedNodes g'
 
     findEdge g s l =
-      let xs = filter isPred $ lsuc g l
-          rs = filter isSucc $ concatMap (lsuc g . fst) xs
-      in foldr (toNewInclusion g l . fst) s rs
+      let xs = CG.foldlSucc predEdgeF [] g l
+          rs = F.foldl' (\acc x -> CG.foldlSucc succEdgeF acc g x) [] xs
+      in foldr (toNewInclusion g l) s rs
 
     toNewInclusion g l r !s =
-      case edgeExists g (Edge l r) of
-        Just _ -> s
-        Nothing -> S.insert (l, r) s
+      case CG.edgeExists g l r of
+        True -> s
+        False -> HS.insert (l, r) s
 
-isPred :: (Node IFGraph, EdgeLabel IFGraph) -> Bool
-isPred = (==Pred) . snd
+predEdgeF :: [Int] -> Int -> ConstraintEdge -> [Int]
+predEdgeF acc _ Succ = acc
+predEdgeF acc p Pred = p : acc
 
-isSucc :: (Node IFGraph, EdgeLabel IFGraph) -> Bool
-isSucc = (==Succ) . snd
-
+succEdgeF :: [Int] -> Int -> ConstraintEdge -> [Int]
+succEdgeF acc s Succ = s : acc
+succEdgeF acc _ Pred = acc
 
 solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
 solvedSystemGraphElems (SolvedSystem g _ v) = (ns, es)
   where
-    ns = map (\(LNode nid _) -> (nid, V.unsafeIndex v nid)) $ labNodes g
-    es = map (\(LEdge (Edge s d) l) -> (s, d, l)) $ labEdges g
+    ns = map (\(G.LNode nid _) -> (nid, V.unsafeIndex v nid)) $ G.labNodes g
+    es = map (\(G.LEdge (G.Edge s d) l) -> (s, d, l)) $ G.labEdges g
