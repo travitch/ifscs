@@ -373,10 +373,6 @@ data InclusionEndpoints = IE {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 instance Hashable InclusionEndpoints where
   hash (IE l r) = l `combine` r
 
-predEdgeF :: [Int] -> Int -> ConstraintEdge -> [Int]
-predEdgeF acc _ Succ = acc
-predEdgeF acc p Pred = p : acc
-
 succEdgeF :: [Int] -> Int -> ConstraintEdge -> [Int]
 succEdgeF acc s Succ = s : acc
 succEdgeF acc _ Pred = acc
