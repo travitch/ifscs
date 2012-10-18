@@ -17,7 +17,7 @@ library
                    Constraints.Set.ConstraintGraph
   other-modules: Constraints.Set.Implementation
   build-depends: base == 4.*, failure, mtl > 2, containers, hashable,
-                 hbgl, persistent-vector, unordered-containers
+                 hbgl, persistent-vector, unordered-containers, lrucache
   hs-source-dirs: src
   ghc-options: -Wall
   ghc-prof-options: -auto-all

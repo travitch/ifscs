@@ -1,5 +1,6 @@
 module Constraints.Set.ConstraintGraph (
   Graph,
+  ConstraintEdge(..),
   emptyGraph,
   insNode,
   insEdge,
@@ -7,66 +8,83 @@ module Constraints.Set.ConstraintGraph (
   edgeExists,
   foldlPred,
   foldlSucc,
+  removeNode,
   graphNodes,
   graphEdges
   ) where
 
 import Data.IntMap ( IntMap )
 import qualified Data.IntMap as IM
+import Data.IntSet ( IntSet )
+import qualified Data.IntSet as IS
 import Data.Monoid
 
+data ConstraintEdge = Succ | Pred
+                    deriving (Eq, Ord, Show)
 -- Pred Succ
-data Adj e = Adj (IntMap e) (IntMap e)
-type Gr e = IntMap (Adj e)
+data Adj = Adj (IntMap ConstraintEdge) (IntMap ConstraintEdge)
+type Gr = IntMap Adj
 
-newtype Graph e = Graph { unGraph :: Gr e }
+newtype Graph = Graph { unGraph :: Gr }
 
-emptyAdj :: Adj e
+emptyAdj :: Adj
 emptyAdj = Adj mempty mempty
 
-emptyGraph :: Graph e
+emptyGraph :: Graph
 emptyGraph = Graph mempty
 
-insEdge :: Int -> Int -> e -> Graph e -> Graph e
+insEdge :: Int -> Int -> ConstraintEdge -> Graph -> Graph
 insEdge src dst lbl (Graph g) =
   let g1 = IM.adjust (addSucc dst lbl) src g
       g2 = IM.adjust (addPred src lbl) dst g1
   in Graph g2
 
-addSucc :: Int -> e -> Adj e -> Adj e
+addSucc :: Int -> ConstraintEdge -> Adj -> Adj
 addSucc dst lbl (Adj ps ss) = Adj ps (IM.insert dst lbl ss)
 
-addPred :: Int -> e -> Adj e -> Adj e
+addPred :: Int -> ConstraintEdge -> Adj -> Adj
 addPred src lbl (Adj ps ss) = Adj (IM.insert src lbl ps) ss
 
-insNode :: Int -> Graph e -> Graph e
+insNode :: Int -> Graph -> Graph
 insNode nid = Graph . IM.insert nid emptyAdj . unGraph
 
-edgeExists :: Graph e -> Int -> Int -> Bool
+edgeExists :: Graph -> Int -> Int -> Bool
 edgeExists (Graph g) src dst =
   case IM.lookup src g of
     Nothing -> False
     Just (Adj _ ss) -> IM.member dst ss
 
-foldlPred :: (a -> Int -> e -> a) -> a -> Graph e -> Int -> a
+foldlPred :: (a -> Int -> ConstraintEdge -> a) -> a -> Graph -> Int -> a
 foldlPred f seed (Graph g) nid =
   case IM.lookup nid g of
     Nothing -> seed
     Just (Adj ps _) -> IM.foldlWithKey' f seed ps
 
-foldlSucc :: (a -> Int -> e -> a) -> a -> Graph e -> Int -> a
+foldlSucc :: (a -> Int -> ConstraintEdge -> a) -> a -> Graph -> Int -> a
 foldlSucc f seed (Graph g) nid =
   case IM.lookup nid g of
     Nothing -> seed
     Just (Adj _ ss) -> IM.foldlWithKey' f seed ss
 
-nodes :: Graph e -> [Int]
+removeNode :: Int -> Graph -> Graph
+removeNode n g@(Graph g0) =
+  case IM.lookup n g0 of
+    Nothing -> g
+    Just (Adj ps ss) ->
+      let g1 = IM.foldrWithKey' (\src _ -> IM.adjust (removeSucc n) src) g0 ps
+          g2 = IM.foldrWithKey' (\dst _ -> IM.adjust (removePred n) dst) g1 ss
+      in Graph $ IM.delete n g2
+
+removeSucc n (Adj ps ss) = Adj ps (IM.delete n ss)
+removePred n (Adj ps ss) = Adj (IM.delete n ps) ss
+
+nodes :: Graph -> [Int]
 nodes = IM.keys . unGraph
 
-graphNodes :: Graph e -> [(Int, ())]
+graphNodes :: Graph -> [(Int, ())]
 graphNodes (Graph g) = zip (IM.keys g) (repeat ())
 
-graphEdges :: Graph e -> [(Int, Int, e)]
+graphEdges :: Graph -> [(Int, Int, ConstraintEdge)]
 graphEdges = IM.foldrWithKey edgesForNode [] . unGraph
   where
     edgesForNode nid (Adj _ ss) acc =

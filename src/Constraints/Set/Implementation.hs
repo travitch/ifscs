@@ -24,11 +24,14 @@ module Constraints.Set.Implementation (
 import Control.Exception
 import Control.Failure
 import Control.Monad.State.Strict
+import qualified Data.Cache.LRU as LRU
 import qualified Data.Foldable as F
 import qualified Data.Graph.Interface as G
 import qualified Data.Graph.LazyHAMT as HAMT
 import Data.Graph.Algorithms.Matching.DFS
 import Data.Hashable
+import Data.IntSet ( IntSet )
+import qualified Data.IntSet as IS
 import Data.List ( intercalate )
 import Data.Map ( Map )
 import qualified Data.Map as M
@@ -40,7 +43,11 @@ import Data.Typeable
 import Data.Vector.Persistent ( Vector )
 import qualified Data.Vector.Persistent as V
 
+import Constraints.Set.ConstraintGraph ( ConstraintEdge(..) )
 import qualified Constraints.Set.ConstraintGraph as CG
+
+import Debug.Trace
+debug = flip trace
 
 -- FIXME: Build up a mutable graph (in ST) with an efficient edge
 -- existence test and then convert to a LazyHAMT afterward.
@@ -169,10 +176,8 @@ simplifySystem (ConstraintSystem is) = do
   is' <- foldM simplifyInclusion [] is
   return $! ConstraintSystem is'
 
-data ConstraintEdge = Succ | Pred
-                    deriving (Eq, Ord, Show)
 
-type IFGraph = CG.Graph ConstraintEdge
+type IFGraph = CG.Graph
 type SolvedGraph = HAMT.Gr () ConstraintEdge
 
 data SolvedSystem v c = SolvedSystem { systemIFGraph :: SolvedGraph
@@ -219,20 +224,29 @@ constraintsToIFGraph (ConstraintSystem is) =
                , systemIdToSetMap = v
                }
   where
+    s0 = BuilderState { exprIdMap = mempty
+                      , idExprMap = mempty
+                      , lruCache = LRU.newLRU (Just 5000)
+                      }
     -- The initial graph has all of the nodes we need; after that we
     -- just need to saturate the edges through transitive closure
-    (g, (m, v)) = runState (buildInitialGraph is >>= saturateGraph) (mempty, mempty)
+    (g, bs) = runState (buildInitialGraph is >>= saturateGraph) s0
+    BuilderState m v _ = bs
     ns = map (\(nid, _) -> G.LNode nid ()) $ CG.graphNodes g
     es = map (\(s,d,l) -> G.LEdge (G.Edge s d) l) $ CG.graphEdges g
 
-type BuilderMonad v c = State (Map (SetExpression v c) Int, Vector (SetExpression v c))
+data BuilderState v c = BuilderState { exprIdMap :: Map (SetExpression v c) Int
+                                     , idExprMap :: Vector (SetExpression v c)
+                                     , lruCache :: LRU.LRU Int ()
+                                     }
+type BuilderMonad v c = State (BuilderState v c)
 
 -- | Build an initial IF constraint graph that contains all of the
 -- vertices and the edges induced by the initial simplified constraint
 -- system.
 buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c IFGraph
 buildInitialGraph is = do
-  res <- foldM addInclusion (CG.emptyGraph, mempty) is
+  res <- foldM (addInclusion True) (CG.emptyGraph, mempty) is
   return (fst res)
 
 data PredSegment = PS {-# UNPACK #-} !Int {-# UNPACK #-} !Int
@@ -245,23 +259,59 @@ instance Hashable PredSegment where
 -- necessary).  Returns the set of nodes that are affected (and will
 -- need more transitive edges).
 addInclusion :: (Eq c, Ord v, Ord c)
-                => (IFGraph, HashSet PredSegment)
+                => Bool
+                -> (IFGraph, HashSet PredSegment)
                 -> Inclusion v c
                 -> BuilderMonad v c (IFGraph, HashSet PredSegment)
-addInclusion acc i =
+addInclusion removeCycles acc i =
   case i of
     -- This is the key to an inductive form graph (rather than
     -- standard form)
     e1@(SetVariable v1) :<= e2@(SetVariable v2) ->
       case compare v1 v2 of
         EQ -> error "Constraints.Set.Solver.addInclusion: invalid A ⊆ A constraint"
-        LT -> addEdge acc Pred e1 e2
-        GT -> addEdge acc Succ e1 e2
+        LT -> addEdge removeCycles acc Pred e1 e2
+        GT -> addEdge removeCycles acc Succ e1 e2
     e1@(ConstructedTerm _ _ _) :<= e2@(SetVariable _) ->
-      addEdge acc Pred e1 e2
+      addEdge removeCycles acc Pred e1 e2
     e1@(SetVariable _) :<= e2@(ConstructedTerm _ _ _) ->
-      addEdge acc Succ e1 e2
+      addEdge removeCycles acc Succ e1 e2
     _ -> error "Constraints.Set.Solver.addInclusion: unexpected expression"
+
+-- Track both a visited set and a "the nodes on the cycle" set
+checkChain :: Bool -> ConstraintEdge -> IFGraph -> Int -> Int -> Maybe IntSet
+checkChain False _ _ _ _ = Nothing
+checkChain True tgt g from to =
+  let (_, chain) = checkChainWorker (mempty, Nothing) tgt g from to
+  in maybe Nothing (Just . IS.insert from) chain
+
+-- Only checkChainWorker adds things to the visited set
+checkChainWorker :: (IntSet, Maybe IntSet) -> ConstraintEdge -> IFGraph -> Int -> Int -> (IntSet, Maybe IntSet)
+checkChainWorker (visited, chain) tgt g from to
+  | from == to = (visited, Just (IS.singleton to))
+  | otherwise =
+    let visited' = IS.insert from visited
+    in CG.foldlPred (checkChainEdges tgt g to) (visited', chain) g from
+
+-- Once we have a branch of the DFS that succeeds, just keep that
+-- value.  This manages augmenting the set of nodes on the chain
+checkChainEdges :: ConstraintEdge
+                   -> IFGraph
+                   -> Int
+                   -> (IntSet, Maybe IntSet)
+                   -> Int
+                   -> ConstraintEdge
+                   -> (IntSet, Maybe IntSet)
+checkChainEdges _ _ _ acc@(_, Just _) _ _ = acc
+checkChainEdges tgt g to acc@(visited, Nothing) v lbl
+  | tgt /= lbl = acc
+  | IS.member v visited = acc
+  | otherwise =
+    -- If there was no hit on this branch, just return the accumulator
+    -- from the recursive call (which has an updated visited set)
+    case checkChainWorker acc tgt g v to of
+      acc'@(_, Nothing) -> acc'
+      (visited', Just chain) -> (visited', Just (IS.insert v chain))
 
 -- | Add an edge in the constraint graph between the two expressions
 -- with the given label.  Adds nodes for the expressions if necessary.
@@ -272,28 +322,85 @@ addInclusion acc i =
 -- work when re-visiting the source nodes (already visited nodes can
 -- be ignored).
 addEdge :: (Eq v, Eq c, Ord v, Ord c)
-           => (IFGraph, HashSet PredSegment)
+           => Bool
+           -> (IFGraph, HashSet PredSegment)
            -> ConstraintEdge
            -> SetExpression v c
            -> SetExpression v c
            -> BuilderMonad v c (IFGraph, HashSet PredSegment)
-addEdge (!g0, !affected) etype e1 e2 = do
+addEdge removeCycles (!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
-  let !g3 = CG.insEdge eid1 eid2 etype g2
 
-  -- If the edge we added is a predecessor edge, eid1 needs to be
-  -- scanned again later because new successors to eid2 might be
-  -- reachable.
-  --
-  -- Otherwise, all predecessors to eid1 (with Pred edge labels) need
-  -- to be scanned later.
+  BuilderState m v cache <- get
+
+  case LRU.lookup eid1 cache of
+    (_, Nothing) -> do
+      put $ BuilderState m v (LRU.insert eid1 () cache)
+      tryCycleDetection removeCycles g2 affected etype eid1 eid2
+    (cache', Just _) -> do
+      put $ BuilderState m v cache'
+      simpleAddEdge g2 affected etype eid1 eid2
+
+simpleAddEdge g2 affected etype eid1 eid2 = do
+  let !g3 = CG.insEdge eid1 eid2 etype g2
   case etype of
     Pred -> return $ (g3, HS.insert (PS eid1 eid2) affected)
     Succ -> return $ (g3, CG.foldlPred (addPredPred eid1) affected g3 eid1)
   where
     addPredPred _ acc _ Succ = acc
-    addPredPred eid1 acc pid Pred = HS.insert (PS pid eid1) acc
+    addPredPred eid acc pid Pred = HS.insert (PS pid eid) acc
+
+tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
+  case checkChain removeCycles (otherLabel etype) g2 eid1 eid2 of
+    Just chain | IS.size chain > 1 -> do
+      -- Make all of the nodes in the cycle refer to the min element
+      -- (the reference bit is taken care of in the node lookup and in
+      -- the result lookup).
+      --
+      -- For each of the nodes in @rest@, repoint their incoming and
+      -- outgoing edges.
+      BuilderState m v c <- get
+      -- Find all of the edges from any node pointing to a node in
+      -- @rest@.  Also find all edges from @rest@ out into the rest of
+      -- the graph.  Then resolve those back to inclusions using @v@
+      -- and call addInclusion over these new inclusions (after
+      -- blowing away the old ones)
+      let (representative, rest) = IS.deleteFindMin chain
+          thisExp = V.unsafeIndex v representative
+          newIncoming = IS.foldr' (srcsOf g2 v representative thisExp) [] rest
+          newOutgoing = IS.foldr' (destsOf g2 v representative thisExp) [] rest
+          newInclusions = newIncoming ++ newOutgoing
+          g3 = IS.foldr' CG.removeNode g2 rest
+          m' = IS.foldr' (replaceWith v representative) m rest
+      put $! BuilderState m' v c
+      foldM (addInclusion False) (g3, affected) newInclusions -- `debug` ("Removing " ++ show (IS.size chain) ++ " cycle")
+      -- Nothing was affected because we didn't add any edges
+    _ -> simpleAddEdge g2 affected etype eid1 eid2
+  where
+    otherLabel Succ = Pred
+    otherLabel Pred = Succ
+
+srcsOf g v newId newDst oldId acc =
+  CG.foldlPred (\a srcId _ ->
+                 case srcId == newId of
+                   True -> a
+                   False -> (V.unsafeIndex v srcId :<= newDst) : a) acc g oldId
+
+destsOf g v newId newSrc oldId acc =
+  CG.foldlSucc (\a dstId _ ->
+                 case newId == dstId of
+                   True -> a
+                   False -> (newSrc :<= V.unsafeIndex v dstId) : a) acc g oldId
+
+-- | Change the ID of the node with ID @i@ to @repr@
+replaceWith :: (Ord k) => Vector k -> a -> Int -> Map k a -> Map k a
+replaceWith v repr i m =
+  case M.lookup se m of
+    Nothing -> m
+    Just _ -> M.insert se repr m
+  where
+    se = V.unsafeIndex v i
 
 -- | Get the ID for the expression node.  Inserts a new node into the
 -- graph if needed.
@@ -302,15 +409,17 @@ getEID :: (Ord v, Ord c)
           -> IFGraph
           -> BuilderMonad v c (Int, IFGraph)
 getEID e g = do
-  (m, v) <- get
+  BuilderState m v c <- get
   case M.lookup e m of
+    -- Even if we find the ID for the expression, we have to check to
+    -- see if the node has been renamed due to cycle elimination
     Just i -> return (i, g)
     Nothing -> do
       let eid = V.length v
           !v' = V.snoc v e
           !m' = M.insert e eid m
           !g' = CG.insNode eid g
-      put (m', v')
+      put $! BuilderState m' v' c
       return (eid, g')
 
 -- | For each node L in the graph, follow its predecessor edges to
@@ -351,13 +460,13 @@ saturateGraph g0 = closureEdges es0 g0
     closureEdges ns g
       | HS.null ns = return g
       | otherwise = do
-        (_, v) <- get
+        v <- gets idExprMap
         let nextEdges = F.foldl' (findEdge g) mempty ns
             inclusions = F.foldl' (simplify v) [] nextEdges
         case null inclusions of
           True -> return g
           False -> do
-            (g', affectedNodes) <- foldM addInclusion (g, mempty) inclusions
+            (g', affectedNodes) <- foldM (addInclusion True) (g, mempty) inclusions
             closureEdges affectedNodes g'
 
     findEdge g s (PS l x) =
