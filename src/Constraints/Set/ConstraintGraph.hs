@@ -1,10 +1,11 @@
+{-# LANGUAGE BangPatterns #-}
 module Constraints.Set.ConstraintGraph (
   Graph,
   ConstraintEdge(..),
   emptyGraph,
   insNode,
   insEdge,
-  nodes,
+  numNodes,
   edgeExists,
   foldlPred,
   foldlSucc,
@@ -15,14 +16,12 @@ module Constraints.Set.ConstraintGraph (
 
 import Data.IntMap ( IntMap )
 import qualified Data.IntMap as IM
-import Data.IntSet ( IntSet )
-import qualified Data.IntSet as IS
 import Data.Monoid
 
 data ConstraintEdge = Succ | Pred
                     deriving (Eq, Ord, Show)
 -- Pred Succ
-data Adj = Adj (IntMap ConstraintEdge) (IntMap ConstraintEdge)
+data Adj = Adj !(IntMap ConstraintEdge) !(IntMap ConstraintEdge)
 type Gr = IntMap Adj
 
 newtype Graph = Graph { unGraph :: Gr }
@@ -35,8 +34,8 @@ emptyGraph = Graph mempty
 
 insEdge :: Int -> Int -> ConstraintEdge -> Graph -> Graph
 insEdge src dst lbl (Graph g) =
-  let g1 = IM.adjust (addSucc dst lbl) src g
-      g2 = IM.adjust (addPred src lbl) dst g1
+  let !g1 = IM.adjust (addSucc dst lbl) src g
+      !g2 = IM.adjust (addPred src lbl) dst g1
   in Graph g2
 
 addSucc :: Int -> ConstraintEdge -> Adj -> Adj
@@ -71,15 +70,18 @@ removeNode n g@(Graph g0) =
   case IM.lookup n g0 of
     Nothing -> g
     Just (Adj ps ss) ->
-      let g1 = IM.foldrWithKey' (\src _ -> IM.adjust (removeSucc n) src) g0 ps
-          g2 = IM.foldrWithKey' (\dst _ -> IM.adjust (removePred n) dst) g1 ss
+      let !g1 = IM.foldrWithKey' (\src _ -> IM.adjust (removeSucc n) src) g0 ps
+          !g2 = IM.foldrWithKey' (\dst _ -> IM.adjust (removePred n) dst) g1 ss
       in Graph $ IM.delete n g2
 
+removeSucc :: Int -> Adj -> Adj
 removeSucc n (Adj ps ss) = Adj ps (IM.delete n ss)
+
+removePred :: Int -> Adj -> Adj
 removePred n (Adj ps ss) = Adj (IM.delete n ps) ss
 
-nodes :: Graph -> [Int]
-nodes = IM.keys . unGraph
+numNodes :: Graph -> Int
+numNodes = IM.size . unGraph
 
 graphNodes :: Graph -> [(Int, ())]
 graphNodes (Graph g) = zip (IM.keys g) (repeat ())
