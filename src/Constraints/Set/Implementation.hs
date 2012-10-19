@@ -347,7 +347,7 @@ addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
     False -> do
       -- BuilderState m v cnt <- get
       b <- checkCycles
-      case b && removeCycles of
+      case False of -- b && removeCycles of
         True -> tryCycleDetection removeCycles g2 affected etype eid1 eid2
         False -> simpleAddEdge g2 affected etype eid1 eid2
   -- case LRU.lookup eid1 cache of
@@ -485,7 +485,7 @@ saturateGraph g0 = closureEdges es0 g0
     closureEdges ns g
       | HS.null ns = return g
       | otherwise = do
-        BuilderState m v _ <- get
+        BuilderState m v _ <- get `debug` show (HS.size ns)
         let nextEdges = F.foldl' (findEdge m v g) mempty ns
             inclusions = F.foldl' (simplify v) [] nextEdges
         case null inclusions of
@@ -494,6 +494,7 @@ saturateGraph g0 = closureEdges es0 g0
             (g', affectedNodes) <- foldM (addInclusion True) (g, mempty) inclusions
             closureEdges affectedNodes g'
 
+{-# INLINE findEdge #-}
 findEdge :: (Ord k) => Map k Int -> Vector k -> IFGraph
             -> HashSet InclusionEndpoints -> PredSegment
             -> HashSet InclusionEndpoints
@@ -506,17 +507,19 @@ data InclusionEndpoints = IE {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 instance Hashable InclusionEndpoints where
   hash (IE l r) = l `combine` r
 
+{-# INLINE toNewInclusion #-}
 toNewInclusion :: (Ord k) => Map k Int -> Vector k -> IFGraph
                   -> Int -> HashSet InclusionEndpoints
                   -> Int -> ConstraintEdge
                   -> HashSet InclusionEndpoints
 toNewInclusion _ _ _ _ acc _ Pred = acc
 toNewInclusion m v g l acc r Succ =
-  let l' = M.findWithDefault l (V.unsafeIndex v l) m
-      r' = M.findWithDefault r (V.unsafeIndex v r) m
-  in case CG.edgeExists g l' r' of
+  -- let l' = M.findWithDefault l (V.unsafeIndex v l) m
+  --     r' = M.findWithDefault r (V.unsafeIndex v r) m
+  -- in
+   case CG.edgeExists g l r of
     True -> acc
-    False -> HS.insert (IE l' r') acc
+    False -> HS.insert (IE l r) acc
 
 solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
 solvedSystemGraphElems (SolvedSystem g _ v) = (ns, es)
