@@ -24,7 +24,6 @@ module Constraints.Set.Implementation (
 import Control.Exception
 import Control.Failure
 import Control.Monad.State.Strict
-import qualified Data.Cache.LRU as LRU
 import qualified Data.Foldable as F
 import qualified Data.Graph.Interface as G
 import qualified Data.Graph.LazyHAMT as HAMT
@@ -226,18 +225,23 @@ constraintsToIFGraph (ConstraintSystem is) =
   where
     s0 = BuilderState { exprIdMap = mempty
                       , idExprMap = mempty
-                      , lruCache = LRU.newLRU (Just 5000)
+                      , lruCache = Nothing -- LRU.newLRU (Just 10000)
                       }
     -- The initial graph has all of the nodes we need; after that we
     -- just need to saturate the edges through transitive closure
-    (g, bs) = runState (buildInitialGraph is >>= saturateGraph) s0
+    (g, bs) = runState act s0 -- (buildInitialGraph is >>= saturateGraph) s0
+    act = do
+      theGraph <- buildInitialGraph is
+      BuilderState m0 v0 _ <- get
+      put $ BuilderState m0 v0 (Just 0)
+      saturateGraph theGraph
     BuilderState m v _ = bs
     ns = map (\(nid, _) -> G.LNode nid ()) $ CG.graphNodes g
     es = map (\(s,d,l) -> G.LEdge (G.Edge s d) l) $ CG.graphEdges g
 
 data BuilderState v c = BuilderState { exprIdMap :: Map (SetExpression v c) Int
                                      , idExprMap :: Vector (SetExpression v c)
-                                     , lruCache :: LRU.LRU Int ()
+                                     , lruCache :: Maybe Int -- LRU.LRU Int ()
                                      }
 type BuilderMonad v c = State (BuilderState v c)
 
@@ -281,9 +285,9 @@ addInclusion removeCycles acc i =
 -- Track both a visited set and a "the nodes on the cycle" set
 checkChain :: Bool -> ConstraintEdge -> IFGraph -> Int -> Int -> Maybe IntSet
 checkChain False _ _ _ _ = Nothing
-checkChain True tgt g from to =
-  let (_, chain) = checkChainWorker (mempty, Nothing) tgt g from to
-  in maybe Nothing (Just . IS.insert from) chain
+checkChain True tgt g from to = do
+  chain <- snd $ checkChainWorker (mempty, Nothing) tgt g from to
+  return $ IS.insert from chain
 
 -- Only checkChainWorker adds things to the visited set
 checkChainWorker :: (IntSet, Maybe IntSet) -> ConstraintEdge -> IFGraph -> Int -> Int -> (IntSet, Maybe IntSet)
@@ -313,6 +317,13 @@ checkChainEdges tgt g to acc@(visited, Nothing) v lbl
       acc'@(_, Nothing) -> acc'
       (visited', Just chain) -> (visited', Just (IS.insert v chain))
 
+checkCycles :: BuilderMonad v c Bool
+checkCycles = do
+  BuilderState _ _ cnt <- get
+  case cnt of
+    Nothing -> return True
+    Just c -> return $ c <= 1000
+
 -- | Add an edge in the constraint graph between the two expressions
 -- with the given label.  Adds nodes for the expressions if necessary.
 --
@@ -328,20 +339,26 @@ addEdge :: (Eq v, Eq c, Ord v, Ord c)
            -> SetExpression v c
            -> SetExpression v c
            -> BuilderMonad v c (IFGraph, HashSet PredSegment)
-addEdge removeCycles (!g0, !affected) etype e1 e2 = do
+addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
+  case eid1 == eid2 || CG.edgeExists g2 eid1 eid2 of
+    True -> return acc
+    False -> do
+      -- BuilderState m v cnt <- get
+      b <- checkCycles
+      case b && removeCycles of
+        True -> tryCycleDetection removeCycles g2 affected etype eid1 eid2
+        False -> simpleAddEdge g2 affected etype eid1 eid2
+  -- case LRU.lookup eid1 cache of
+  --   (_, Nothing) -> do
+  --     put $ BuilderState m v (LRU.insert eid1 () cache)
+  --     tryCycleDetection removeCycles g2 affected etype eid1 eid2
+  --   (cache', Just _) -> do
+  --     put $ BuilderState m v cache'
+  --     simpleAddEdge g2 affected etype eid1 eid2
 
-  BuilderState m v cache <- get
-
-  case LRU.lookup eid1 cache of
-    (_, Nothing) -> do
-      put $ BuilderState m v (LRU.insert eid1 () cache)
-      tryCycleDetection removeCycles g2 affected etype eid1 eid2
-    (cache', Just _) -> do
-      put $ BuilderState m v cache'
-      simpleAddEdge g2 affected etype eid1 eid2
-
+simpleAddEdge :: IFGraph -> HashSet PredSegment -> ConstraintEdge -> Int -> Int -> BuilderMonad v c (IFGraph, HashSet PredSegment)
 simpleAddEdge g2 affected etype eid1 eid2 = do
   let !g3 = CG.insEdge eid1 eid2 etype g2
   case etype of
@@ -351,9 +368,12 @@ simpleAddEdge g2 affected etype eid1 eid2 = do
     addPredPred _ acc _ Succ = acc
     addPredPred eid acc pid Pred = HS.insert (PS pid eid) acc
 
+tryCycleDetection :: (Ord c, Ord v) => Bool -> IFGraph
+                     -> HashSet PredSegment -> ConstraintEdge
+                     -> Int -> Int -> BuilderMonad v c (IFGraph, HashSet PredSegment)
 tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
   case checkChain removeCycles (otherLabel etype) g2 eid1 eid2 of
-    Just chain | IS.size chain > 1 -> do
+    Just chain | not (IS.null chain) -> do
       -- Make all of the nodes in the cycle refer to the min element
       -- (the reference bit is taken care of in the node lookup and in
       -- the result lookup).
@@ -368,28 +388,27 @@ tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
       -- blowing away the old ones)
       let (representative, rest) = IS.deleteFindMin chain
           thisExp = V.unsafeIndex v representative
-          newIncoming = IS.foldr' (srcsOf g2 v representative thisExp) [] rest
-          newOutgoing = IS.foldr' (destsOf g2 v representative thisExp) [] rest
-          newInclusions = newIncoming ++ newOutgoing
+          newIncoming = IS.foldr' (srcsOf g2 v chain thisExp) [] rest
+          newInclusions = IS.foldr' (destsOf g2 v chain thisExp) newIncoming rest
           g3 = IS.foldr' CG.removeNode g2 rest
           m' = IS.foldr' (replaceWith v representative) m rest
-      put $! BuilderState m' v c
-      foldM (addInclusion False) (g3, affected) newInclusions -- `debug` ("Removing " ++ show (IS.size chain) ++ " cycle")
+      put $! BuilderState m' v (maybe Nothing (Just . (+1)) c)
+      foldM (addInclusion False) (g3, affected) newInclusions `debug` ("Removing " ++ show (IS.size chain) ++ " cycle (" ++ show eid1 ++ " to " ++ show eid2 ++ ". " ++ show (CG.numNodes g3) ++ " nodes left in the graph")
       -- Nothing was affected because we didn't add any edges
     _ -> simpleAddEdge g2 affected etype eid1 eid2
   where
     otherLabel Succ = Pred
     otherLabel Pred = Succ
 
-srcsOf g v newId newDst oldId acc =
+srcsOf g v chain newDst oldId acc =
   CG.foldlPred (\a srcId _ ->
-                 case srcId == newId of
+                 case IS.member srcId chain of
                    True -> a
                    False -> (V.unsafeIndex v srcId :<= newDst) : a) acc g oldId
 
-destsOf g v newId newSrc oldId acc =
+destsOf g v chain newSrc oldId acc =
   CG.foldlSucc (\a dstId _ ->
-                 case newId == dstId of
+                 case IS.member dstId chain of
                    True -> a
                    False -> (newSrc :<= V.unsafeIndex v dstId) : a) acc g oldId
 
@@ -457,11 +476,17 @@ saturateGraph g0 = closureEdges es0 g0
       let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
           Just incl' = simplifyInclusion e incl
       in incl'
+    -- Here is our problem (possibly also related to the self loops
+    -- appearing).  We find new edges with findEdge, which just
+    -- consults adjacency links.  Some of these refer to old nodes
+    -- that were eliminated?  Shouldn't...  But the edges identified
+    -- might not exist (and will never exist because their endpoints
+    -- are collapsed).
     closureEdges ns g
       | HS.null ns = return g
       | otherwise = do
-        v <- gets idExprMap
-        let nextEdges = F.foldl' (findEdge g) mempty ns
+        BuilderState m v _ <- get
+        let nextEdges = F.foldl' (findEdge m v g) mempty ns
             inclusions = F.foldl' (simplify v) [] nextEdges
         case null inclusions of
           True -> return g
@@ -469,14 +494,11 @@ saturateGraph g0 = closureEdges es0 g0
             (g', affectedNodes) <- foldM (addInclusion True) (g, mempty) inclusions
             closureEdges affectedNodes g'
 
-    findEdge g s (PS l x) =
-      let rs = CG.foldlSucc succEdgeF [] g x
-      in foldr (toNewInclusion g l) s rs
-
-    toNewInclusion g l r !s =
-      case CG.edgeExists g l r of
-        True -> s
-        False -> HS.insert (IE l r) s
+findEdge :: (Ord k) => Map k Int -> Vector k -> IFGraph
+            -> HashSet InclusionEndpoints -> PredSegment
+            -> HashSet InclusionEndpoints
+findEdge m v g s (PS l x) =
+  CG.foldlSucc (toNewInclusion m v g l) s g x
 
 data InclusionEndpoints = IE {-# UNPACK #-} !Int {-# UNPACK #-} !Int
                         deriving (Eq)
@@ -484,9 +506,17 @@ data InclusionEndpoints = IE {-# UNPACK #-} !Int {-# UNPACK #-} !Int
 instance Hashable InclusionEndpoints where
   hash (IE l r) = l `combine` r
 
-succEdgeF :: [Int] -> Int -> ConstraintEdge -> [Int]
-succEdgeF acc s Succ = s : acc
-succEdgeF acc _ Pred = acc
+toNewInclusion :: (Ord k) => Map k Int -> Vector k -> IFGraph
+                  -> Int -> HashSet InclusionEndpoints
+                  -> Int -> ConstraintEdge
+                  -> HashSet InclusionEndpoints
+toNewInclusion _ _ _ _ acc _ Pred = acc
+toNewInclusion m v g l acc r Succ =
+  let l' = M.findWithDefault l (V.unsafeIndex v l) m
+      r' = M.findWithDefault r (V.unsafeIndex v r) m
+  in case CG.edgeExists g l' r' of
+    True -> acc
+    False -> HS.insert (IE l' r') acc
 
 solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
 solvedSystemGraphElems (SolvedSystem g _ v) = (ns, es)
