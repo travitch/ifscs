@@ -345,9 +345,9 @@ addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
   case eid1 == eid2 || CG.edgeExists g2 eid1 eid2 of
     True -> return acc
     False -> do
-      -- BuilderState m v cnt <- get
-      b <- checkCycles
-      case False of -- b && removeCycles of
+      -- b <- checkCycles
+      -- case b && removeCycles of
+      case False of
         True -> tryCycleDetection removeCycles g2 affected etype eid1 eid2
         False -> simpleAddEdge g2 affected etype eid1 eid2
   -- case LRU.lookup eid1 cache of
@@ -366,11 +366,16 @@ simpleAddEdge g2 affected etype eid1 eid2 = do
     Succ -> return $ (g3, CG.foldlPred (addPredPred eid1) affected g3 eid1)
   where
     addPredPred _ acc _ Succ = acc
-    addPredPred eid acc pid Pred = HS.insert (PS pid eid) acc
+    addPredPred eid acc pid Pred =
+      HS.insert (PS pid eid) acc
+
+-- With cycle elimination the count of affected nodes each iteration
+-- is an order of magnitude higher than it should be...
 
 tryCycleDetection :: (Ord c, Ord v) => Bool -> IFGraph
                      -> HashSet PredSegment -> ConstraintEdge
                      -> Int -> Int -> BuilderMonad v c (IFGraph, HashSet PredSegment)
+tryCycleDetection _ g2 affected Succ eid1 eid2 = simpleAddEdge g2 affected Succ eid1 eid2
 tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
   case checkChain removeCycles (otherLabel etype) g2 eid1 eid2 of
     Just chain | not (IS.null chain) -> do
@@ -393,7 +398,10 @@ tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
           g3 = IS.foldr' CG.removeNode g2 rest
           m' = IS.foldr' (replaceWith v representative) m rest
       put $! BuilderState m' v (maybe Nothing (Just . (+1)) c)
-      foldM (addInclusion False) (g3, affected) newInclusions `debug` ("Removing " ++ show (IS.size chain) ++ " cycle (" ++ show eid1 ++ " to " ++ show eid2 ++ ". " ++ show (CG.numNodes g3) ++ " nodes left in the graph")
+      foldM (addInclusion False) (g3, affected) newInclusions `debug`
+        ("Removing " ++ show (IS.size chain) ++ " cycle (" ++ show eid1 ++
+         " to " ++ show eid2 ++ "). " ++ show (CG.numNodes g3) ++
+         " nodes left in the graph.") --   Re-adding " ++ show (length newInclusions) ++ " inclusions.")
       -- Nothing was affected because we didn't add any edges
     _ -> simpleAddEdge g2 affected etype eid1 eid2
   where
