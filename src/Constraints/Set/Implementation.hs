@@ -45,8 +45,8 @@ import qualified Data.Vector.Persistent as V
 import Constraints.Set.ConstraintGraph ( ConstraintEdge(..) )
 import qualified Constraints.Set.ConstraintGraph as CG
 
-import Debug.Trace
-debug = flip trace
+-- import Debug.Trace
+-- debug = flip trace
 
 -- FIXME: Build up a mutable graph (in ST) with an efficient edge
 -- existence test and then convert to a LazyHAMT afterward.
@@ -398,22 +398,28 @@ tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
           g3 = IS.foldr' CG.removeNode g2 rest
           m' = IS.foldr' (replaceWith v representative) m rest
       put $! BuilderState m' v (maybe Nothing (Just . (+1)) c)
-      foldM (addInclusion False) (g3, affected) newInclusions `debug`
-        ("Removing " ++ show (IS.size chain) ++ " cycle (" ++ show eid1 ++
-         " to " ++ show eid2 ++ "). " ++ show (CG.numNodes g3) ++
-         " nodes left in the graph.") --   Re-adding " ++ show (length newInclusions) ++ " inclusions.")
+      foldM (addInclusion False) (g3, affected) newInclusions --  `debug`
+        -- ("Removing " ++ show (IS.size chain) ++ " cycle (" ++ show eid1 ++
+        --  " to " ++ show eid2 ++ "). " ++ show (CG.numNodes g3) ++
+        --  " nodes left in the graph.")
       -- Nothing was affected because we didn't add any edges
     _ -> simpleAddEdge g2 affected etype eid1 eid2
   where
     otherLabel Succ = Pred
     otherLabel Pred = Succ
 
+srcsOf :: IFGraph -> Vector (SetExpression v c) -> IntSet
+          -> SetExpression v c -> Int -> [Inclusion v c]
+          -> [Inclusion v c]
 srcsOf g v chain newDst oldId acc =
   CG.foldlPred (\a srcId _ ->
                  case IS.member srcId chain of
                    True -> a
                    False -> (V.unsafeIndex v srcId :<= newDst) : a) acc g oldId
 
+destsOf :: IFGraph -> Vector (SetExpression v c) -> IntSet
+          -> SetExpression v c -> Int -> [Inclusion v c]
+          -> [Inclusion v c]
 destsOf g v chain newSrc oldId acc =
   CG.foldlSucc (\a dstId _ ->
                  case IS.member dstId chain of
@@ -493,7 +499,7 @@ saturateGraph g0 = closureEdges es0 g0
     closureEdges ns g
       | HS.null ns = return g
       | otherwise = do
-        BuilderState m v _ <- get `debug` show (HS.size ns)
+        BuilderState m v _ <- get -- `debug` show (HS.size ns)
         let nextEdges = F.foldl' (findEdge m v g) mempty ns
             inclusions = F.foldl' (simplify v) [] nextEdges
         case null inclusions of
@@ -521,7 +527,7 @@ toNewInclusion :: (Ord k) => Map k Int -> Vector k -> IFGraph
                   -> Int -> ConstraintEdge
                   -> HashSet InclusionEndpoints
 toNewInclusion _ _ _ _ acc _ Pred = acc
-toNewInclusion m v g l acc r Succ =
+toNewInclusion _ _ g l acc r Succ =
   -- let l' = M.findWithDefault l (V.unsafeIndex v l) m
   --     r' = M.findWithDefault r (V.unsafeIndex v r) m
   -- in
