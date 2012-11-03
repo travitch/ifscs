@@ -1,4 +1,11 @@
 {-# LANGUAGE BangPatterns #-}
+-- | This is a very simple graph data structure.  It is less
+-- featureful than FGL or hbgl, but the operations required for
+-- saturation are faster and allocate much less memory.
+--
+-- The main changes are that it doesn't provide a @match@ operation
+-- and it does provide in-place iteration over predecessor and
+-- successor edges.
 module Constraints.Set.ConstraintGraph (
   Graph,
   ConstraintEdge(..),

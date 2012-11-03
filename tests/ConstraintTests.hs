@@ -170,8 +170,7 @@ solveFor :: String -> String -> [Int] -> [Inclusion String Int] -> Assertion
 solveFor name var expected is =
   assertEqual name (sort (map toSetExp expected)) (sort sol)
   where
-    cs = constraintSystem is
-    Just solved = solveSystem cs
+    Just solved = solveSystem is
     Just sol = leastSolution solved var
 
 toSetExp :: Int -> SetExpression v Int
@@ -182,7 +181,7 @@ pt1 :: Assertion
 pt1 = assertEqual "pt1" [loc "b"] sol
   where
     sol = either throwErr id $ do
-      s <- solveSystem (constraintSystem is)
+      s <- solveSystem is
       leastSolution s "Xa"
     ref = term "ref" [Covariant, Covariant, Contravariant]
     loc name = ref [atom name, setVariable ("X"++name), setVariable ("X"++name)]
@@ -215,7 +214,7 @@ pt2 :: Assertion
 pt2 = assertEqual "pt2" (sort [loc "x", loc "z"]) (sort sol)
   where
     sol = either throwErr id $ do
-      s <- solveSystem (constraintSystem is)
+      s <- solveSystem is
       leastSolution s "Xp1"
     ref = term "ref" [Covariant, Covariant, Contravariant]
     loc name = ref [atom name, setVariable ("X"++name), setVariable ("X"++name)]

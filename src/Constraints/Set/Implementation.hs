@@ -5,7 +5,6 @@ module Constraints.Set.Implementation (
   Variance(..),
   Inclusion,
   SetExpression(..),
-  ConstraintSystem,
   SolvedSystem,
   emptySet,
   universalSet,
@@ -13,7 +12,6 @@ module Constraints.Set.Implementation (
   atom,
   term,
   (<=!),
-  constraintSystem,
   solveSystem,
   leastSolution,
   -- * Debugging
@@ -45,40 +43,21 @@ import qualified Data.Vector.Persistent as V
 import Constraints.Set.ConstraintGraph ( ConstraintEdge(..) )
 import qualified Constraints.Set.ConstraintGraph as CG
 
--- import Debug.Trace
--- debug = flip trace
-
--- FIXME: Build up a mutable graph (in ST) with an efficient edge
--- existence test and then convert to a LazyHAMT afterward.
---
--- Also, see about reducing the actual graph to be over Ints instead
--- of requiring complex comparisons (compare is taking 25% of the
--- runtime).
---
--- It shouldn't be necessary to keep node labels at all; just their
--- ids.  The saturation process never references them
-
--- 1) Take the list of initial constraints and simplify them using the
--- rewrite rules.  Once they are solved, all constraints are in
--- *atomic form*.
---
--- One approach is to fold over the list of constraints and simplify
--- each one until it is in atomic form (simplification can produce
--- multiple constraints).  Once at atomic form, add the constraint to
--- a set.
-
--- 2) Use the atomic constraints to build the closure graph.
-
+-- | Create a set expression representing the empty set
 emptySet :: SetExpression v c
 emptySet = EmptySet
 
+-- | Create a set expression representing the universal set
 universalSet :: SetExpression v c
 universalSet = UniversalSet
 
+-- | Create a new set variable with the given label
 setVariable :: v -> SetExpression v c
 setVariable = SetVariable
 
--- | Atomic terms have a label and arity zero.
+-- | Atomic terms have a label and arity zero.  This is a shortcut for
+--
+-- > term conLabel [] []
 atom :: c -> SetExpression v c
 atom conLabel = ConstructedTerm conLabel [] []
 
@@ -86,18 +65,25 @@ atom conLabel = ConstructedTerm conLabel [] []
 -- SetExpressions.  It is meant to be partially applied so that as
 -- many terms as possible can share the same reference to a label and
 -- signature.
+--
+-- The list of variances specifies the variance (Covariant or
+-- Contravariant) for each argument of the term.  A mismatch in the
+-- length of the variance descriptor and the arguments to the term
+-- will result in a run-time error.
 term :: c -> [Variance] -> ([SetExpression v c] -> SetExpression v c)
 term = ConstructedTerm
 
+-- | Construct an inclusion relation between two set expressions.
+--
+-- This is equivalent to @se1 ⊆ se2@.
 (<=!) :: SetExpression v c -> SetExpression v c -> Inclusion v c
 (<=!) = (:<=)
 
-constraintSystem :: [Inclusion v c] -> ConstraintSystem v c
-constraintSystem = ConstraintSystem
-
+-- | Tags to mark term arguments as covariant or contravariant.
 data Variance = Covariant | Contravariant
               deriving (Eq, Ord, Show)
 
+-- | Expressions in the language of set constraints.
 data SetExpression v c = EmptySet
                        | UniversalSet
                        | SetVariable v
@@ -114,28 +100,26 @@ instance (Show v, Show c) => Show (SetExpression v c) where
            , ")"
            ]
 
--- | An inclusion is a constraint of the form se1 ⊆ se2
+-- | An inclusion is a constraint of the form @se1 ⊆ se2@
 data Inclusion v c = (SetExpression v c) :<= (SetExpression v c)
-                                 deriving (Eq, Ord)
+                   deriving (Eq, Ord)
 
 instance (Show v, Show c) => Show (Inclusion v c) where
   show (lhs :<= rhs) = concat [ show lhs, " ⊆ ", show rhs ]
 
--- | A constraint system is a set of constraints in DNF.  The
--- disjuncts are implicit.
-data ConstraintSystem v c = ConstraintSystem [Inclusion v c]
-                          deriving (Eq, Ord, Show)
-
-data ConstraintError v c = NoSolution (Inclusion v c)
-                         | NoVariableLabel v
+-- | The types of errors that can be encountered during constraint
+-- resolution
+data ConstraintError v c = NoSolution (Inclusion v c) -- ^ The system has no solution because of the given inclusion constraint
+                         | NoVariableLabel v -- ^ When searching for a solution, the requested variable was not present in the constraint graph
                          deriving (Eq, Ord, Show, Typeable)
 
 instance (Typeable v, Typeable c, Show v, Show c) => Exception (ConstraintError v c)
 
--- | Simplify one set expression.
+-- | Simplify one set expression.  The expression may be eliminated,
+-- passed through unchanged, or split into multiple new expressions.
 simplifyInclusion :: (Failure (ConstraintError v c) m, Eq v, Eq c)
-                     => [Inclusion v c]
-                     -> Inclusion v c
+                     => [Inclusion v c] -- ^ An accumulator list
+                     -> Inclusion v c -- ^ The inclusion to be simplified
                      -> m [Inclusion v c]
 simplifyInclusion acc i =
   case i of
@@ -159,6 +143,10 @@ simplifyInclusion acc i =
     -- Keep anything else (atomic forms)
     _ -> return (i : acc)
 
+-- | Simplifies an inclusion taking variance into account; this is a
+-- helper for 'simplifyInclusion' that deals with the variance of
+-- constructed terms.  The key here is that contravariant inclusions
+-- are /flipped/.
 simplifyWithVariance :: (Failure (ConstraintError v c) m, Eq v, Eq c)
                         => [Inclusion v c]
                         -> (Variance, SetExpression v c, SetExpression v c)
@@ -168,24 +156,35 @@ simplifyWithVariance acc (Covariant, se1, se2) =
 simplifyWithVariance acc (Contravariant, se1, se2) =
   simplifyInclusion acc (se2 :<= se1)
 
+-- | Simplify all of the inclusions in the initial constraint system.
 simplifySystem :: (Failure (ConstraintError v c) m, Eq v, Eq c)
-                  => ConstraintSystem v c
-                  -> m (ConstraintSystem v c)
-simplifySystem (ConstraintSystem is) = do
-  is' <- foldM simplifyInclusion [] is
-  return $! ConstraintSystem is'
+                  => [Inclusion v c]
+                  -> m [Inclusion v c]
+simplifySystem = foldM simplifyInclusion []
 
-
+-- | The type used to represent that inductive form constraint graph
+-- during saturation.  This form is more efficient to saturate.
 type IFGraph = CG.Graph
+
+-- | The type representing the inductive constraint graph after it has
+-- been saturated.  This change in representations is used to make DFS
+-- queries easier.
 type SolvedGraph = HAMT.Gr () ConstraintEdge
 
-data SolvedSystem v c = SolvedSystem { systemIFGraph :: SolvedGraph
-                                     , systemSetToIdMap :: Map (SetExpression v c) Int
-                                     , systemIdToSetMap :: Vector (SetExpression v c)
-                                     }
+-- | The solved constraint system
+data SolvedSystem v c =
+  SolvedSystem { systemIFGraph :: SolvedGraph
+               , systemSetToIdMap :: Map (SetExpression v c) Int
+               , systemIdToSetMap :: Vector (SetExpression v c)
+               }
 
+instance (Eq v, Eq c) => Eq (SolvedSystem v c) where
+  (SolvedSystem g1 m1 v1) == (SolvedSystem g2 m2 v2) =
+    m1 == m2 && v1 == v2 && G.graphEqual g1 g2
 
--- | Compute the least solution for the given variable
+-- | Compute the least solution for the given variable.  This can fail
+-- if the requested variable is not present in the constraint system
+-- (see 'ConstraintError').
 --
 -- LS(y) = All source nodes with a predecessor edge to y, plus LS(x)
 -- for all x where x has a predecessor edge to y.
@@ -209,15 +208,18 @@ leastSolution (SolvedSystem g0 m v) varLabel = do
         ConstructedTerm _ _ _ -> return se
         _ -> Nothing
 
+-- | Simplify and solve the system of set constraints
 solveSystem :: (Failure (ConstraintError v c) m, Eq c, Eq v, Ord c, Ord v)
-               => ConstraintSystem v c
+               => [Inclusion v c]
                -> m (SolvedSystem v c)
 solveSystem s = do
   s' <- simplifySystem s
   return $! constraintsToIFGraph s'
 
-constraintsToIFGraph :: (Ord v, Ord c) => ConstraintSystem v c -> SolvedSystem v c
-constraintsToIFGraph (ConstraintSystem is) =
+-- | The real worker to solve the system and convert from an IFGraph
+-- to a SolvedGraph.
+constraintsToIFGraph :: (Ord v, Ord c) => [Inclusion v c] -> SolvedSystem v c
+constraintsToIFGraph is =
   SolvedSystem { systemIFGraph = G.mkGraph ns es
                , systemSetToIdMap = m
                , systemIdToSetMap = v
@@ -229,7 +231,7 @@ constraintsToIFGraph (ConstraintSystem is) =
                       }
     -- The initial graph has all of the nodes we need; after that we
     -- just need to saturate the edges through transitive closure
-    (g, bs) = runState act s0 -- (buildInitialGraph is >>= saturateGraph) s0
+    (g, bs) = runState act s0
     act = do
       theGraph <- buildInitialGraph is
       BuilderState m0 v0 _ <- get
@@ -239,10 +241,17 @@ constraintsToIFGraph (ConstraintSystem is) =
     ns = map (\(nid, _) -> G.LNode nid ()) $ CG.graphNodes g
     es = map (\(s,d,l) -> G.LEdge (G.Edge s d) l) $ CG.graphEdges g
 
+-- | Metadata used to construct the constraint graph from the initial
+-- inclusion constraints.  This maps set expressions to unique Int
+-- identifiers, which are faster to reference during saturation.  The
+-- expressions themselves don't matter during saturation.
 data BuilderState v c = BuilderState { exprIdMap :: Map (SetExpression v c) Int
                                      , idExprMap :: Vector (SetExpression v c)
                                      , lruCache :: Maybe Int -- LRU.LRU Int ()
                                      }
+
+-- | The monadic environment in which the constraint graph is built
+-- and solved.
 type BuilderMonad v c = State (BuilderState v c)
 
 -- | Build an initial IF constraint graph that contains all of the
@@ -253,6 +262,9 @@ buildInitialGraph is = do
   res <- foldM (addInclusion True) (CG.emptyGraph, mempty) is
   return (fst res)
 
+-- | This is just a strict (and unboxed) pair representing an edge
+-- being added to the worklist because it will be the base of a new
+-- closure edge.
 data PredSegment = PS {-# UNPACK #-} !Int {-# UNPACK #-} !Int
                  deriving (Eq, Ord)
 
@@ -317,6 +329,7 @@ checkChainEdges tgt g to acc@(visited, Nothing) v lbl
       acc'@(_, Nothing) -> acc'
       (visited', Just chain) -> (visited', Just (IS.insert v chain))
 
+-- | Ask if we should bother to check for cycles this iteration
 checkCycles :: BuilderMonad v c Bool
 checkCycles = do
   BuilderState _ _ cnt <- get
@@ -326,12 +339,6 @@ checkCycles = do
 
 -- | Add an edge in the constraint graph between the two expressions
 -- with the given label.  Adds nodes for the expressions if necessary.
---
--- FIXME: Instead of just returning a simple set here, we can return a
--- set of pairs (edges) that we know will need to be added.  Adding
--- those edges would then add more, &c.  This would save asymptotic
--- work when re-visiting the source nodes (already visited nodes can
--- be ignored).
 addEdge :: (Eq v, Eq c, Ord v, Ord c)
            => Bool
            -> (IFGraph, HashSet PredSegment)
@@ -350,14 +357,8 @@ addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
       case False of
         True -> tryCycleDetection removeCycles g2 affected etype eid1 eid2
         False -> simpleAddEdge g2 affected etype eid1 eid2
-  -- case LRU.lookup eid1 cache of
-  --   (_, Nothing) -> do
-  --     put $ BuilderState m v (LRU.insert eid1 () cache)
-  --     tryCycleDetection removeCycles g2 affected etype eid1 eid2
-  --   (cache', Just _) -> do
-  --     put $ BuilderState m v cache'
-  --     simpleAddEdge g2 affected etype eid1 eid2
 
+-- | Add an edge without trying to detect new cycles
 simpleAddEdge :: IFGraph -> HashSet PredSegment -> ConstraintEdge -> Int -> Int -> BuilderMonad v c (IFGraph, HashSet PredSegment)
 simpleAddEdge g2 affected etype eid1 eid2 = do
   let !g3 = CG.insEdge eid1 eid2 etype g2
@@ -369,9 +370,10 @@ simpleAddEdge g2 affected etype eid1 eid2 = do
     addPredPred eid acc pid Pred =
       HS.insert (PS pid eid) acc
 
--- With cycle elimination the count of affected nodes each iteration
--- is an order of magnitude higher than it should be...
-
+-- | Try to detect cycles as in FFSA98.  Note that this is currently
+-- broken somehow.  It detects cycles just fine, but removing them
+-- seems to damage the constraint graph somehow making the solving
+-- phase much slower.
 tryCycleDetection :: (Ord c, Ord v) => Bool -> IFGraph
                      -> HashSet PredSegment -> ConstraintEdge
                      -> Int -> Int -> BuilderMonad v c (IFGraph, HashSet PredSegment)
@@ -528,10 +530,7 @@ toNewInclusion :: (Ord k) => Map k Int -> Vector k -> IFGraph
                   -> HashSet InclusionEndpoints
 toNewInclusion _ _ _ _ acc _ Pred = acc
 toNewInclusion _ _ g l acc r Succ =
-  -- let l' = M.findWithDefault l (V.unsafeIndex v l) m
-  --     r' = M.findWithDefault r (V.unsafeIndex v r) m
-  -- in
-   case CG.edgeExists g l r of
+  case CG.edgeExists g l r of
     True -> acc
     False -> HS.insert (IE l r) acc
 
