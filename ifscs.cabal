@@ -19,9 +19,11 @@ library
   exposed-modules: Constraints.Set.Solver,
                    Constraints.Set.Internal
   other-modules: Constraints.Set.Implementation,
-                 Constraints.Set.ConstraintGraph
+                 Constraints.Set.ConstraintGraph,
+                 Constraints.Set.MapReduce
   build-depends: base == 4.*, failure, mtl > 2, containers, hashable,
-                 hbgl, persistent-vector, unordered-containers
+                 hbgl, persistent-vector, unordered-containers,
+                 deepseq, monad-par >= 0.3
   hs-source-dirs: src
   ghc-options: -Wall
   ghc-prof-options: -auto-all
@@ -33,4 +35,4 @@ test-suite ConstraintTests
   main-is: ConstraintTests.hs
   build-depends: ifscs, base,
                  test-framework, test-framework-hunit, HUnit
-  ghc-options: -Wall
+  ghc-options: -Wall -threaded

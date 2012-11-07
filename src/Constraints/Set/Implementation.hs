@@ -19,10 +19,10 @@ module Constraints.Set.Implementation (
   solvedSystemGraphElems
   ) where
 
+import Control.DeepSeq
 import Control.Exception
 import Control.Failure
 import Control.Monad.State.Strict
-import qualified Data.Foldable as F
 import qualified Data.Graph.Interface as G
 import qualified Data.Graph.LazyHAMT as HAMT
 import Data.Graph.Algorithms.Matching.DFS
@@ -42,6 +42,7 @@ import qualified Data.Vector.Persistent as V
 
 import Constraints.Set.ConstraintGraph ( ConstraintEdge(..) )
 import qualified Constraints.Set.ConstraintGraph as CG
+import Constraints.Set.MapReduce
 
 -- | Create a set expression representing the empty set
 emptySet :: SetExpression v c
@@ -89,6 +90,14 @@ data SetExpression v c = EmptySet
                        | SetVariable v
                        | ConstructedTerm c [Variance] [SetExpression v c]
                        deriving (Eq, Ord)
+
+-- Fake instance because we never create new SetExpressions during
+-- saturation.
+instance NFData (SetExpression v c) where
+  rnf _ = ()
+
+instance NFData (Inclusion v c) where
+  rnf (_ :<= _) = ()
 
 instance (Show v, Show c) => Show (SetExpression v c) where
   show EmptySet = "∅"
@@ -488,10 +497,6 @@ saturateGraph g0 = closureEdges es0 g0
     predToPredSeg (l, r, Pred) = return $ PS l r
     predToPredSeg _ = Nothing
 
-    simplify v e (IE l r) =
-      let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
-          Just incl' = simplifyInclusion e incl
-      in incl'
     -- Here is our problem (possibly also related to the self loops
     -- appearing).  We find new edges with findEdge, which just
     -- consults adjacency links.  Some of these refer to old nodes
@@ -501,38 +506,37 @@ saturateGraph g0 = closureEdges es0 g0
     closureEdges ns g
       | HS.null ns = return g
       | otherwise = do
-        BuilderState m v _ <- get -- `debug` show (HS.size ns)
-        let nextEdges = F.foldl' (findEdge m v g) mempty ns
-            inclusions = F.foldl' (simplify v) [] nextEdges
+        BuilderState _ v _ <- get
+        let inclusions = mapReduceThresh 1024 ns (findAndSimplifyEdge v g) mappend mempty
         case null inclusions of
           True -> return g
           False -> do
             (g', affectedNodes) <- foldM (addInclusion True) (g, mempty) inclusions
             closureEdges affectedNodes g'
 
-{-# INLINE findEdge #-}
-findEdge :: (Ord k) => Map k Int -> Vector k -> IFGraph
-            -> HashSet InclusionEndpoints -> PredSegment
-            -> HashSet InclusionEndpoints
-findEdge m v g s (PS l x) =
-  CG.foldlSucc (toNewInclusion m v g l) s g x
-
-data InclusionEndpoints = IE {-# UNPACK #-} !Int {-# UNPACK #-} !Int
-                        deriving (Eq)
-
-instance Hashable InclusionEndpoints where
-  hash (IE l r) = l `combine` r
+{-# INLINE findAndSimplifyEdge #-}
+findAndSimplifyEdge :: (Eq v, Eq c)
+                       => Vector (SetExpression v c)
+                       -> IFGraph
+                       -> PredSegment
+                       -> [Inclusion v c]
+findAndSimplifyEdge v g (PS l x) =
+  CG.foldlSucc (toNewInclusion v g l) mempty g x
 
 {-# INLINE toNewInclusion #-}
-toNewInclusion :: (Ord k) => Map k Int -> Vector k -> IFGraph
-                  -> Int -> HashSet InclusionEndpoints
+toNewInclusion :: (Eq v, Eq c)
+                  => Vector (SetExpression v c) -> IFGraph
+                  -> Int -> [Inclusion v c]
                   -> Int -> ConstraintEdge
-                  -> HashSet InclusionEndpoints
-toNewInclusion _ _ _ _ acc _ Pred = acc
-toNewInclusion _ _ g l acc r Succ =
+                  -> [Inclusion v c]
+toNewInclusion _ _ _ acc _ Pred = acc
+toNewInclusion v g l acc r Succ =
   case CG.edgeExists g l r of
     True -> acc
-    False -> HS.insert (IE l r) acc
+    False ->
+      let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
+          Just incl' = simplifyInclusion [] incl
+      in incl' ++ acc
 
 solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
 solvedSystemGraphElems (SolvedSystem g _ v) = (ns, es)
