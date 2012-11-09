@@ -362,9 +362,9 @@ addEdge :: (Eq v, Eq c, Ord v, Ord c)
 addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
-  case eid1 /= eid2 && null (G.edgeExists g2 eid1 eid2) of
-    False -> return acc
-    True -> do
+  case eid1 == eid2 || G.edgeExists g2 eid1 eid2 of
+    True -> return acc
+    False -> do
       -- b <- checkCycles
       -- case b && removeCycles of
       case False of
@@ -538,9 +538,9 @@ toNewInclusion :: (Eq v, Eq c)
                   -> [Inclusion v c]
 toNewInclusion _ _ _ _ Pred acc = acc
 toNewInclusion v g l r Succ acc =
-  case null (G.edgeExists g l r) of
-    False -> acc
-    True ->
+  case G.edgeExists g l r of
+    True -> acc
+    False ->
       let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
           Just incl' = simplifyInclusion [] incl
       in incl' ++ acc
