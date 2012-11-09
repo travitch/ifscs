@@ -24,8 +24,8 @@ import Control.Exception
 import Control.Failure
 import Control.Monad.State.Strict
 import qualified Data.Graph.Interface as G
-import qualified Data.Graph.LazyHAMT as HAMT
-import Data.Graph.Algorithms.Matching.DFS
+import Data.Graph.MutableDigraph
+import Data.Graph.Algorithms.DFS
 import Data.Hashable
 import Data.IntSet ( IntSet )
 import qualified Data.IntSet as IS
@@ -40,9 +40,12 @@ import Data.Typeable
 import Data.Vector.Persistent ( Vector )
 import qualified Data.Vector.Persistent as V
 
-import Constraints.Set.ConstraintGraph ( ConstraintEdge(..) )
-import qualified Constraints.Set.ConstraintGraph as CG
+-- import Constraints.Set.ConstraintGraph ( ConstraintEdge(..) )
+-- import qualified Constraints.Set.ConstraintGraph as CG
 import Constraints.Set.MapReduce
+
+data ConstraintEdge = Succ | Pred
+                    deriving (Eq, Ord, Show)
 
 -- | Create a set expression representing the empty set
 emptySet :: SetExpression v c
@@ -173,12 +176,12 @@ simplifySystem = foldM simplifyInclusion []
 
 -- | The type used to represent that inductive form constraint graph
 -- during saturation.  This form is more efficient to saturate.
-type IFGraph = CG.Graph
+type IFGraph = DenseDigraph () ConstraintEdge -- CG.Graph
 
 -- | The type representing the inductive constraint graph after it has
 -- been saturated.  This change in representations is used to make DFS
 -- queries easier.
-type SolvedGraph = HAMT.Gr () ConstraintEdge
+type SolvedGraph = DenseDigraph () ConstraintEdge -- HAMT.Gr () ConstraintEdge
 
 -- | The solved constraint system
 data SolvedSystem v c =
@@ -189,7 +192,7 @@ data SolvedSystem v c =
 
 instance (Eq v, Eq c) => Eq (SolvedSystem v c) where
   (SolvedSystem g1 m1 v1) == (SolvedSystem g2 m2 v2) =
-    m1 == m2 && v1 == v2 && G.graphEqual g1 g2
+    m1 == m2 && v1 == v2 && g1 == g2
 
 -- | Compute the least solution for the given variable.  This can fail
 -- if the requested variable is not present in the constraint system
@@ -203,7 +206,8 @@ leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c)
                  -> m [SetExpression v c]
 leastSolution (SolvedSystem g0 m v) varLabel = do
   case M.lookup (SetVariable varLabel) m of
-    Nothing -> failure ex
+    Nothing -> failure ex -- FIXME reverse all of the edges and use a
+                          -- simpler graph structure
     Just nid -> return $ catMaybes $ xdfsWith G.pre' addTerm [nid] g0
   where
     ex :: ConstraintError v c
@@ -211,7 +215,7 @@ leastSolution (SolvedSystem g0 m v) varLabel = do
 
     -- We only want to add ConstructedTerms to the output list
     addTerm :: G.Context SolvedGraph -> Maybe (SetExpression v c)
-    addTerm (G.Context _ (G.LNode nid _) _) = do
+    addTerm (G.Context _ nid _ _) = do
       se <- V.index v nid
       case se of
         ConstructedTerm _ _ _ -> return se
@@ -247,8 +251,8 @@ constraintsToIFGraph is =
       put $ BuilderState m0 v0 (Just 0)
       saturateGraph theGraph
     BuilderState m v _ = bs
-    ns = map (\(nid, _) -> G.LNode nid ()) $ CG.graphNodes g
-    es = map (\(s,d,l) -> G.LEdge (G.Edge s d) l) $ CG.graphEdges g
+    ns = map (\nid -> (nid, ())) $ G.vertices g
+    es = map (\(G.Edge s d l) -> (G.Edge s d l)) $ G.edges g
 
 -- | Metadata used to construct the constraint graph from the initial
 -- inclusion constraints.  This maps set expressions to unique Int
@@ -268,7 +272,7 @@ type BuilderMonad v c = State (BuilderState v c)
 -- system.
 buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c IFGraph
 buildInitialGraph is = do
-  res <- foldM (addInclusion True) (CG.emptyGraph, mempty) is
+  res <- foldM (addInclusion True) (G.empty, mempty) is
   return (fst res)
 
 -- | This is just a strict (and unboxed) pair representing an edge
@@ -316,19 +320,19 @@ checkChainWorker (visited, chain) tgt g from to
   | from == to = (visited, Just (IS.singleton to))
   | otherwise =
     let visited' = IS.insert from visited
-    in CG.foldlPred (checkChainEdges tgt g to) (visited', chain) g from
+    in G.foldPre (checkChainEdges tgt g to) (visited', chain) g from
 
 -- Once we have a branch of the DFS that succeeds, just keep that
 -- value.  This manages augmenting the set of nodes on the chain
 checkChainEdges :: ConstraintEdge
                    -> IFGraph
                    -> Int
-                   -> (IntSet, Maybe IntSet)
                    -> Int
                    -> ConstraintEdge
                    -> (IntSet, Maybe IntSet)
-checkChainEdges _ _ _ acc@(_, Just _) _ _ = acc
-checkChainEdges tgt g to acc@(visited, Nothing) v lbl
+                   -> (IntSet, Maybe IntSet)
+checkChainEdges _ _ _ _ _ acc@(_, Just _) = acc
+checkChainEdges tgt g to v lbl acc@(visited, Nothing)
   | tgt /= lbl = acc
   | IS.member v visited = acc
   | otherwise =
@@ -358,9 +362,9 @@ addEdge :: (Eq v, Eq c, Ord v, Ord c)
 addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
-  case eid1 == eid2 || CG.edgeExists g2 eid1 eid2 of
-    True -> return acc
-    False -> do
+  case eid1 /= eid2 && null (G.edgeExists g2 eid1 eid2) of
+    False -> return acc
+    True -> do
       -- b <- checkCycles
       -- case b && removeCycles of
       case False of
@@ -370,13 +374,13 @@ addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
 -- | Add an edge without trying to detect new cycles
 simpleAddEdge :: IFGraph -> HashSet PredSegment -> ConstraintEdge -> Int -> Int -> BuilderMonad v c (IFGraph, HashSet PredSegment)
 simpleAddEdge g2 affected etype eid1 eid2 = do
-  let !g3 = CG.insEdge eid1 eid2 etype g2
+  let Just g3 = G.insertEdge eid1 eid2 etype g2
   case etype of
     Pred -> return $ (g3, HS.insert (PS eid1 eid2) affected)
-    Succ -> return $ (g3, CG.foldlPred (addPredPred eid1) affected g3 eid1)
+    Succ -> return $ (g3, G.foldPre (addPredPred eid1) affected g3 eid1)
   where
-    addPredPred _ acc _ Succ = acc
-    addPredPred eid acc pid Pred =
+    addPredPred _ _ Succ acc = acc
+    addPredPred eid pid Pred acc =
       HS.insert (PS pid eid) acc
 
 -- | Try to detect cycles as in FFSA98.  Note that this is currently
@@ -406,7 +410,7 @@ tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
           thisExp = V.unsafeIndex v representative
           newIncoming = IS.foldr' (srcsOf g2 v chain thisExp) [] rest
           newInclusions = IS.foldr' (destsOf g2 v chain thisExp) newIncoming rest
-          g3 = IS.foldr' CG.removeNode g2 rest
+          g3 = IS.foldr' G.removeVertex g2 rest
           m' = IS.foldr' (replaceWith v representative) m rest
       put $! BuilderState m' v (maybe Nothing (Just . (+1)) c)
       foldM (addInclusion False) (g3, affected) newInclusions --  `debug`
@@ -423,19 +427,19 @@ srcsOf :: IFGraph -> Vector (SetExpression v c) -> IntSet
           -> SetExpression v c -> Int -> [Inclusion v c]
           -> [Inclusion v c]
 srcsOf g v chain newDst oldId acc =
-  CG.foldlPred (\a srcId _ ->
-                 case IS.member srcId chain of
-                   True -> a
-                   False -> (V.unsafeIndex v srcId :<= newDst) : a) acc g oldId
+  G.foldPre (\srcId _ a ->
+              case IS.member srcId chain of
+                True -> a
+                False -> (V.unsafeIndex v srcId :<= newDst) : a) acc g oldId
 
 destsOf :: IFGraph -> Vector (SetExpression v c) -> IntSet
           -> SetExpression v c -> Int -> [Inclusion v c]
           -> [Inclusion v c]
 destsOf g v chain newSrc oldId acc =
-  CG.foldlSucc (\a dstId _ ->
-                 case IS.member dstId chain of
-                   True -> a
-                   False -> (newSrc :<= V.unsafeIndex v dstId) : a) acc g oldId
+  G.foldSuc (\dstId _ a ->
+              case IS.member dstId chain of
+                True -> a
+                False -> (newSrc :<= V.unsafeIndex v dstId) : a) acc g oldId
 
 -- | Change the ID of the node with ID @i@ to @repr@
 replaceWith :: (Ord k) => Vector k -> a -> Int -> Map k a -> Map k a
@@ -462,7 +466,7 @@ getEID e g = do
       let eid = V.length v
           !v' = V.snoc v e
           !m' = M.insert e eid m
-          !g' = CG.insNode eid g
+          !g' = G.insertVertex eid () g
       put $! BuilderState m' v' c
       return (eid, g')
 
@@ -493,8 +497,8 @@ saturateGraph g0 = closureEdges es0 g0
   where
     -- Initialize the saturation worklist with all of the predecessor
     -- edges in the initial graph
-    es0 = HS.fromList $ mapMaybe predToPredSeg $ CG.graphEdges g0
-    predToPredSeg (l, r, Pred) = return $ PS l r
+    es0 = HS.fromList $ mapMaybe predToPredSeg $ G.edges g0
+    predToPredSeg (G.Edge l r Pred) = return $ PS l r
     predToPredSeg _ = Nothing
 
     -- Here is our problem (possibly also related to the self loops
@@ -521,19 +525,22 @@ findAndSimplifyEdge :: (Eq v, Eq c)
                        -> PredSegment
                        -> [Inclusion v c]
 findAndSimplifyEdge v g (PS l x) =
-  CG.foldlSucc (toNewInclusion v g l) mempty g x
+  G.foldSuc (toNewInclusion v g l) mempty g x
 
 {-# INLINE toNewInclusion #-}
 toNewInclusion :: (Eq v, Eq c)
-                  => Vector (SetExpression v c) -> IFGraph
-                  -> Int -> [Inclusion v c]
-                  -> Int -> ConstraintEdge
+                  => Vector (SetExpression v c)
+                  -> IFGraph
+                  -> Int
+                  -> Int
+                  -> ConstraintEdge
                   -> [Inclusion v c]
-toNewInclusion _ _ _ acc _ Pred = acc
-toNewInclusion v g l acc r Succ =
-  case CG.edgeExists g l r of
-    True -> acc
-    False ->
+                  -> [Inclusion v c]
+toNewInclusion _ _ _ _ Pred acc = acc
+toNewInclusion v g l r Succ acc =
+  case null (G.edgeExists g l r) of
+    False -> acc
+    True ->
       let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
           Just incl' = simplifyInclusion [] incl
       in incl' ++ acc
@@ -541,5 +548,5 @@ toNewInclusion v g l acc r Succ =
 solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
 solvedSystemGraphElems (SolvedSystem g _ v) = (ns, es)
   where
-    ns = map (\(G.LNode nid _) -> (nid, V.unsafeIndex v nid)) $ G.labNodes g
-    es = map (\(G.LEdge (G.Edge s d) l) -> (s, d, l)) $ G.labEdges g
+    ns = map (\nid -> (nid, V.unsafeIndex v nid)) $ G.vertices g
+    es = map (\(G.Edge s d l) -> (s, d, l)) $ G.edges g
