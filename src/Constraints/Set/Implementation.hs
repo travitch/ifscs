@@ -376,8 +376,8 @@ simpleAddEdge :: IFGraph -> HashSet PredSegment -> ConstraintEdge -> Int -> Int 
 simpleAddEdge g2 affected etype eid1 eid2 = do
   let Just g3 = G.insertEdge eid1 eid2 etype g2
   case etype of
-    Pred -> return $ (g3, HS.insert (PS eid1 eid2) affected)
-    Succ -> return $ (g3, G.foldPre (addPredPred eid1) affected g3 eid1)
+    Pred -> return (g3, HS.insert (PS eid1 eid2) affected)
+    Succ -> return (g3, G.foldPre (addPredPred eid1) affected g3 eid1)
   where
     addPredPred _ _ Succ acc = acc
     addPredPred eid pid Pred acc =
@@ -412,7 +412,7 @@ tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
           newInclusions = IS.foldr' (destsOf g2 v chain thisExp) newIncoming rest
           g3 = IS.foldr' G.removeVertex g2 rest
           m' = IS.foldr' (replaceWith v representative) m rest
-      put $! BuilderState m' v (maybe Nothing (Just . (+1)) c)
+      put $! BuilderState m' v (fmap (+1) c)
       foldM (addInclusion False) (g3, affected) newInclusions --  `debug`
         -- ("Removing " ++ show (IS.size chain) ++ " cycle (" ++ show eid1 ++
         --  " to " ++ show eid2 ++ "). " ++ show (CG.numNodes g3) ++
