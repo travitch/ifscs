@@ -19,7 +19,6 @@ library
   exposed-modules: Constraints.Set.Solver,
                    Constraints.Set.Internal
   other-modules: Constraints.Set.Implementation,
---                 Constraints.Set.ConstraintGraph,
                  Constraints.Set.MapReduce
   build-depends: base == 4.*, failure, mtl > 2, containers, hashable,
                  hbgl, persistent-vector, unordered-containers,
