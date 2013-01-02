@@ -40,9 +40,10 @@ import Data.Typeable
 import Data.Vector.Persistent ( Vector )
 import qualified Data.Vector.Persistent as V
 
--- import Constraints.Set.ConstraintGraph ( ConstraintEdge(..) )
--- import qualified Constraints.Set.ConstraintGraph as CG
 import Constraints.Set.MapReduce
+
+
+type Worklist = HashSet PredSegment
 
 data ConstraintEdge = Succ | Pred
                     deriving (Eq, Ord, Show)
@@ -176,12 +177,12 @@ simplifySystem = foldM simplifyInclusion []
 
 -- | The type used to represent that inductive form constraint graph
 -- during saturation.  This form is more efficient to saturate.
-type IFGraph = DenseDigraph () ConstraintEdge -- CG.Graph
+type IFGraph = DenseDigraph () ConstraintEdge
 
 -- | The type representing the inductive constraint graph after it has
 -- been saturated.  This change in representations is used to make DFS
 -- queries easier.
-type SolvedGraph = DenseDigraph () ConstraintEdge -- HAMT.Gr () ConstraintEdge
+type SolvedGraph = DenseDigraph () ConstraintEdge
 
 -- | The solved constraint system
 data SolvedSystem v c =
@@ -265,6 +266,7 @@ data BuilderState v c = BuilderState { exprIdMap :: Map (SetExpression v c) Int
 
 -- | The monadic environment in which the constraint graph is built
 -- and solved.
+-- type BuilderMonad v c = State (BuilderState v c)
 type BuilderMonad v c = State (BuilderState v c)
 
 -- | Build an initial IF constraint graph that contains all of the
@@ -290,9 +292,9 @@ instance Hashable PredSegment where
 -- need more transitive edges).
 addInclusion :: (Eq c, Ord v, Ord c)
                 => Bool
-                -> (IFGraph, HashSet PredSegment)
+                -> (IFGraph, Worklist) -- HashSet PredSegment)
                 -> Inclusion v c
-                -> BuilderMonad v c (IFGraph, HashSet PredSegment)
+                -> BuilderMonad v c (IFGraph, Worklist) -- HashSet PredSegment)
 addInclusion removeCycles acc i =
   case i of
     -- This is the key to an inductive form graph (rather than
@@ -355,11 +357,11 @@ checkCycles = do
 -- with the given label.  Adds nodes for the expressions if necessary.
 addEdge :: (Eq v, Eq c, Ord v, Ord c)
            => Bool
-           -> (IFGraph, HashSet PredSegment)
+           -> (IFGraph, Worklist)
            -> ConstraintEdge
            -> SetExpression v c
            -> SetExpression v c
-           -> BuilderMonad v c (IFGraph, HashSet PredSegment)
+           -> BuilderMonad v c (IFGraph, Worklist)
 addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
@@ -373,24 +375,29 @@ addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
         False -> simpleAddEdge g2 affected etype eid1 eid2
 
 -- | Add an edge without trying to detect new cycles
-simpleAddEdge :: IFGraph -> HashSet PredSegment -> ConstraintEdge -> Int -> Int -> BuilderMonad v c (IFGraph, HashSet PredSegment)
-simpleAddEdge g2 affected etype eid1 eid2 = do
-  let Just g3 = G.insertEdge eid1 eid2 etype g2
+simpleAddEdge :: IFGraph -> Worklist -> ConstraintEdge -> Int -> Int -> BuilderMonad v c (IFGraph, Worklist)
+simpleAddEdge g2 affected etype eid1 eid2 =
   case etype of
     Pred -> return (g3, HS.insert (PS eid1 eid2) affected)
     Succ -> return (g3, G.foldPre (addPredPred eid1) affected g3 eid1)
   where
+    Just g3 = G.insertEdge eid1 eid2 etype g2
     addPredPred _ _ Succ acc = acc
     addPredPred eid pid Pred acc =
       HS.insert (PS pid eid) acc
+
+-- FIXME: Maybe try to mark nodes as "exhausted" after they can't induce
+-- any new edges?
+--
+-- Also, perhaps use bitmasks instead of sets for something?
 
 -- | Try to detect cycles as in FFSA98.  Note that this is currently
 -- broken somehow.  It detects cycles just fine, but removing them
 -- seems to damage the constraint graph somehow making the solving
 -- phase much slower.
 tryCycleDetection :: (Ord c, Ord v) => Bool -> IFGraph
-                     -> HashSet PredSegment -> ConstraintEdge
-                     -> Int -> Int -> BuilderMonad v c (IFGraph, HashSet PredSegment)
+                     -> Worklist -> ConstraintEdge
+                     -> Int -> Int -> BuilderMonad v c (IFGraph, Worklist)
 tryCycleDetection _ g2 affected Succ eid1 eid2 = simpleAddEdge g2 affected Succ eid1 eid2
 tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
   case checkChain removeCycles (otherLabel etype) g2 eid1 eid2 of
@@ -538,13 +545,12 @@ toNewInclusion :: (Eq v, Eq c)
                   -> [Inclusion v c]
                   -> [Inclusion v c]
 toNewInclusion _ _ _ _ Pred acc = acc
-toNewInclusion v g l r Succ acc =
-  case G.edgeExists g l r of
-    True -> acc
-    False ->
-      let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
-          Just incl' = simplifyInclusion [] incl
-      in incl' ++ acc
+toNewInclusion v g l r Succ acc
+  | G.edgeExists g l r = acc
+  | otherwise =
+    let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
+        Just incl' = simplifyInclusion [] incl
+    in incl' ++ acc
 
 solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
 solvedSystemGraphElems (SolvedSystem g _ v) = (ns, es)
