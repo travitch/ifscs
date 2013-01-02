@@ -282,7 +282,8 @@ data PredSegment = PS {-# UNPACK #-} !Int {-# UNPACK #-} !Int
                  deriving (Eq, Ord)
 
 instance Hashable PredSegment where
-  hash (PS l r) = l `combine` r
+  hashWithSalt s (PS l r) =
+    s `hashWithSalt` l `hashWithSalt` r
 
 -- | Adds an inclusion to the constraint graph (adding vertices if
 -- necessary).  Returns the set of nodes that are affected (and will
