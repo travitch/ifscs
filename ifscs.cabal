@@ -20,9 +20,11 @@ library
                    Constraints.Set.Internal
   other-modules: Constraints.Set.Implementation,
                  Constraints.Set.MapReduce
-  build-depends: base == 4.*, failure, mtl > 2, containers, hashable,
-                 hbgl, persistent-vector, unordered-containers,
-                 deepseq, monad-par >= 0.3
+  build-depends: base == 4.*,
+                 mtl > 2,
+                 monad-par >= 0.3,
+                 failure, containers, hashable, unordered-containers,
+                 hbgl, persistent-vector, deepseq
   hs-source-dirs: src
   ghc-options: -Wall
   ghc-prof-options: -auto-all
