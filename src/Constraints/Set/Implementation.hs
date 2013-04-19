@@ -302,8 +302,8 @@ addInclusion removeCycles acc i =
     e1@(SetVariable v1) :<= e2@(SetVariable v2) ->
       case compare v1 v2 of
         EQ -> error "Constraints.Set.Solver.addInclusion: invalid A ⊆ A constraint"
-        LT -> addEdge removeCycles acc Pred e1 e2
-        GT -> addEdge removeCycles acc Succ e1 e2
+        GT -> addEdge removeCycles acc Pred e1 e2
+        LT -> addEdge removeCycles acc Succ e1 e2
     e1@(ConstructedTerm _ _ _) :<= e2@(SetVariable _) ->
       addEdge removeCycles acc Pred e1 e2
     e1@(SetVariable _) :<= e2@(ConstructedTerm _ _ _) ->
