@@ -23,9 +23,9 @@ import Control.DeepSeq
 import Control.Exception
 import Control.Failure
 import Control.Monad.State.Strict
-import qualified Data.Graph.Interface as G
-import Data.Graph.MutableDigraph
-import Data.Graph.Algorithms.DFS
+import Data.Graph.Haggle as G
+import Data.Graph.Haggle.PatriciaTree
+import Data.Graph.Haggle.Algorithms.DFS as G
 import Data.Hashable
 import Data.List ( intercalate )
 import Data.Map ( Map )
@@ -35,8 +35,6 @@ import Data.Monoid
 import Data.HashSet ( HashSet )
 import qualified Data.HashSet as HS
 import Data.Typeable
-import Data.Vector.Persistent ( Vector )
-import qualified Data.Vector.Persistent as V
 
 import Constraints.Set.MapReduce
 
@@ -45,6 +43,45 @@ type Worklist = HashSet PredSegment
 
 data ConstraintEdge = Succ | Pred
                     deriving (Eq, Ord, Show)
+
+-- | The type used to represent that inductive form constraint graph
+-- during saturation.  This form is more efficient to saturate.
+type IFGraph v c = PatriciaTree (SetExpression v c) ConstraintEdge
+
+-- | The type representing the inductive constraint graph after it has
+-- been saturated.  This change in representations is used to make DFS
+-- queries easier.
+-- type SolvedGraph = DenseDigraph () ConstraintEdge
+
+-- | The solved constraint system
+data SolvedSystem v c =
+  SolvedSystem { systemIFGraph :: IFGraph v c
+               , systemSetToIdMap :: Map (SetExpression v c) Vertex
+               }
+
+instance (Eq v, Eq c) => Eq (SolvedSystem v c) where
+  (SolvedSystem g1 m1) == (SolvedSystem g2 m2) =
+    m1 == m2 && labeledVertices g1 == labeledVertices g2 && labeledEdges g1 == labeledEdges g2
+
+-- | Metadata used to construct the constraint graph from the initial
+-- inclusion constraints.  This maps set expressions to unique Int
+-- identifiers, which are faster to reference during saturation.  The
+-- expressions themselves don't matter during saturation.
+data BuilderState v c = BuilderState { exprIdMap :: Map (SetExpression v c) Vertex }
+
+-- | The monadic environment in which the constraint graph is built
+-- and solved.
+-- type BuilderMonad v c = State (BuilderState v c)
+type BuilderMonad v c = State (BuilderState v c)
+-- | This is just a strict (and unboxed) pair representing an edge
+-- being added to the worklist because it will be the base of a new
+-- closure edge.
+data PredSegment = PS {-# UNPACK #-} !Vertex {-# UNPACK #-} !Vertex
+                 deriving (Eq, Ord)
+
+instance Hashable PredSegment where
+  hashWithSalt s (PS l r) =
+    s `hashWithSalt` l `hashWithSalt` r
 
 -- | Create a set expression representing the empty set
 emptySet :: SetExpression v c
@@ -173,25 +210,7 @@ simplifySystem :: (Failure (ConstraintError v c) m, Eq v, Eq c)
                   -> m [Inclusion v c]
 simplifySystem = foldM simplifyInclusion []
 
--- | The type used to represent that inductive form constraint graph
--- during saturation.  This form is more efficient to saturate.
-type IFGraph = DenseDigraph () ConstraintEdge
 
--- | The type representing the inductive constraint graph after it has
--- been saturated.  This change in representations is used to make DFS
--- queries easier.
-type SolvedGraph = DenseDigraph () ConstraintEdge
-
--- | The solved constraint system
-data SolvedSystem v c =
-  SolvedSystem { systemIFGraph :: SolvedGraph
-               , systemSetToIdMap :: Map (SetExpression v c) Int
-               , systemIdToSetMap :: Vector (SetExpression v c)
-               }
-
-instance (Eq v, Eq c) => Eq (SolvedSystem v c) where
-  (SolvedSystem g1 m1 v1) == (SolvedSystem g2 m2 v2) =
-    m1 == m2 && v1 == v2 && g1 == g2
 
 -- | Compute the least solution for the given variable.  This can fail
 -- if the requested variable is not present in the constraint system
@@ -203,19 +222,18 @@ leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c)
                  => SolvedSystem v c
                  -> v
                  -> m [SetExpression v c]
-leastSolution (SolvedSystem g0 m v) varLabel = do
+leastSolution (SolvedSystem g0 m) varLabel = do
   case M.lookup (SetVariable varLabel) m of
-    Nothing -> failure ex -- FIXME reverse all of the edges and use a
-                          -- simpler graph structure
-    Just nid -> return $ catMaybes $ xdfsWith G.pre' addTerm [nid] g0
+    Nothing -> failure ex
+    Just nid -> return $ catMaybes $ rdfsWith g0 (addTerm g0) [nid]
   where
     ex :: ConstraintError v c
     ex = NoVariableLabel varLabel
 
     -- We only want to add ConstructedTerms to the output list
-    addTerm :: G.Context SolvedGraph -> Maybe (SetExpression v c)
-    addTerm (G.Context _ nid _ _) = do
-      se <- V.index v nid
+    addTerm :: IFGraph v c -> Vertex -> Maybe (SetExpression v c)
+    addTerm g v = do
+      let Just se = vertexLabel g v
       case se of
         ConstructedTerm _ _ _ -> return se
         _ -> Nothing
@@ -232,67 +250,35 @@ solveSystem s = do
 -- to a SolvedGraph.
 constraintsToIFGraph :: (Ord v, Ord c) => [Inclusion v c] -> SolvedSystem v c
 constraintsToIFGraph is =
-  SolvedSystem { systemIFGraph = G.mkGraph ns es
+  SolvedSystem { systemIFGraph = g
                , systemSetToIdMap = m
-               , systemIdToSetMap = v
                }
   where
     s0 = BuilderState { exprIdMap = mempty
-                      , idExprMap = mempty
-                      , lruCache = Nothing -- LRU.newLRU (Just 10000)
                       }
     -- The initial graph has all of the nodes we need; after that we
     -- just need to saturate the edges through transitive closure
     (g, bs) = runState act s0
     act = do
-      theGraph <- buildInitialGraph is
-      BuilderState m0 v0 _ <- get
-      put $ BuilderState m0 v0 (Just 0)
-      saturateGraph theGraph
-    BuilderState m v _ = bs
-    ns = map (\nid -> (nid, ())) $ G.vertices g
-    es = map (\(G.Edge s d l) -> (G.Edge s d l)) $ G.edges g
-
--- | Metadata used to construct the constraint graph from the initial
--- inclusion constraints.  This maps set expressions to unique Int
--- identifiers, which are faster to reference during saturation.  The
--- expressions themselves don't matter during saturation.
-data BuilderState v c = BuilderState { exprIdMap :: Map (SetExpression v c) Int
-                                     , idExprMap :: Vector (SetExpression v c)
-                                     , lruCache :: Maybe Int -- LRU.LRU Int ()
-                                     }
-
--- | The monadic environment in which the constraint graph is built
--- and solved.
--- type BuilderMonad v c = State (BuilderState v c)
-type BuilderMonad v c = State (BuilderState v c)
+      (theGraph, wl) <- buildInitialGraph is
+      saturateGraph theGraph wl
+    BuilderState m = bs
 
 -- | Build an initial IF constraint graph that contains all of the
 -- vertices and the edges induced by the initial simplified constraint
 -- system.
-buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c IFGraph
+buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c (IFGraph v c, Worklist)
 buildInitialGraph is = do
-  res <- foldM (addInclusion True) (G.empty, mempty) is
-  return (fst res)
-
--- | This is just a strict (and unboxed) pair representing an edge
--- being added to the worklist because it will be the base of a new
--- closure edge.
-data PredSegment = PS {-# UNPACK #-} !Int {-# UNPACK #-} !Int
-                 deriving (Eq, Ord)
-
-instance Hashable PredSegment where
-  hashWithSalt s (PS l r) =
-    s `hashWithSalt` l `hashWithSalt` r
+  foldM (addInclusion True) (G.emptyGraph, mempty) is
 
 -- | Adds an inclusion to the constraint graph (adding vertices if
 -- necessary).  Returns the set of nodes that are affected (and will
 -- need more transitive edges).
 addInclusion :: (Eq c, Ord v, Ord c)
                 => Bool
-                -> (IFGraph, Worklist)
+                -> (IFGraph v c, Worklist)
                 -> Inclusion v c
-                -> BuilderMonad v c (IFGraph, Worklist)
+                -> BuilderMonad v c (IFGraph v c, Worklist)
 addInclusion removeCycles acc i =
   case i of
     -- This is the key to an inductive form graph (rather than
@@ -300,48 +286,43 @@ addInclusion removeCycles acc i =
     e1@(SetVariable v1) :<= e2@(SetVariable v2) ->
       case compare v1 v2 of
         EQ -> error "Constraints.Set.Solver.addInclusion: invalid A ⊆ A constraint"
-        GT -> addEdge removeCycles acc Pred e1 e2
-        LT -> addEdge removeCycles acc Succ e1 e2
+        GT -> addConstraintEdge removeCycles acc Pred e1 e2
+        LT -> addConstraintEdge removeCycles acc Succ e1 e2
     e1@(ConstructedTerm _ _ _) :<= e2@(SetVariable _) ->
-      addEdge removeCycles acc Pred e1 e2
+      addConstraintEdge removeCycles acc Pred e1 e2
     e1@(SetVariable _) :<= e2@(ConstructedTerm _ _ _) ->
-      addEdge removeCycles acc Succ e1 e2
+      addConstraintEdge removeCycles acc Succ e1 e2
     _ -> error "Constraints.Set.Solver.addInclusion: unexpected expression"
 
 
 -- | Add an edge in the constraint graph between the two expressions
 -- with the given label.  Adds nodes for the expressions if necessary.
-addEdge :: (Eq v, Eq c, Ord v, Ord c)
-           => Bool
-           -> (IFGraph, Worklist)
-           -> ConstraintEdge
-           -> SetExpression v c
-           -> SetExpression v c
-           -> BuilderMonad v c (IFGraph, Worklist)
-addEdge {-removeCycles-}_ acc@(!g0, !affected) etype e1 e2 = do
+addConstraintEdge :: (Eq v, Eq c, Ord v, Ord c)
+                  => Bool
+                  -> (IFGraph v c, Worklist)
+                  -> ConstraintEdge
+                  -> SetExpression v c
+                  -> SetExpression v c
+                  -> BuilderMonad v c (IFGraph v c, Worklist)
+addConstraintEdge {-removeCycles-}_ acc@(!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
   case eid1 == eid2 || G.edgeExists g2 eid1 eid2 of
     True -> return acc
     False -> simpleAddEdge g2 affected etype eid1 eid2
---
---       do
---       -- b <- checkCycles
---       -- case b && removeCycles of
---       case False of
---         True -> tryCycleDetection removeCycles g2 affected etype eid1 eid2
---         False ->
 
 -- | Add an edge without trying to detect new cycles
-simpleAddEdge :: IFGraph -> Worklist -> ConstraintEdge -> Int -> Int -> BuilderMonad v c (IFGraph, Worklist)
+simpleAddEdge :: IFGraph v c -> Worklist -> ConstraintEdge -> Vertex -> Vertex -> BuilderMonad v c (IFGraph v c, Worklist)
 simpleAddEdge g2 affected etype eid1 eid2 =
   case etype of
     Pred -> return (g3, HS.insert (PS eid1 eid2) affected)
-    Succ -> return (g3, G.foldPre (addPredPred eid1) affected g3 eid1)
+    Succ -> do
+      let Just (Context pp _ _) = context g2 eid1
+      return (g3, foldr (addPredPred eid1) affected pp)
   where
-    Just g3 = G.insertEdge eid1 eid2 etype g2
-    addPredPred _ _ Succ acc = acc
-    addPredPred eid pid Pred acc =
+    Just (_, g3) = G.insertLabeledEdge g2 eid1 eid2 etype
+    addPredPred _ (Succ, _) acc = acc
+    addPredPred eid (Pred, pid) acc =
       HS.insert (PS pid eid) acc
 
 
@@ -350,21 +331,19 @@ simpleAddEdge g2 affected etype eid1 eid2 =
 -- graph if needed.
 getEID :: (Ord v, Ord c)
           => SetExpression v c
-          -> IFGraph
-          -> BuilderMonad v c (Int, IFGraph)
+          -> IFGraph v c
+          -> BuilderMonad v c (Vertex, IFGraph v c)
 getEID e g = do
-  BuilderState m v c <- get
+  BuilderState m <- get
   case M.lookup e m of
     -- Even if we find the ID for the expression, we have to check to
     -- see if the node has been renamed due to cycle elimination
-    Just i -> return (i, g)
+    Just v -> return (v, g)
     Nothing -> do
-      let eid = V.length v
-          !v' = V.snoc v e
-          !m' = M.insert e eid m
-          !g' = G.insertVertex eid () g
-      put $! BuilderState m' v' c
-      return (eid, g')
+      let (v, g') = insertLabeledVertex g e
+          !m' = M.insert e v m
+      put $! BuilderState m'
+      return (v, g')
 
 -- | For each node L in the graph, follow its predecessor edges to
 -- obtain set X.  For each ndoe in X, follow its successor edges
@@ -387,64 +366,51 @@ getEID e g = do
 -- implies that no solution is possible.  I think that probably
 -- shouldn't ever happen but I have no proof.
 saturateGraph :: (Eq v, Eq c, Ord v, Ord c)
-                 => IFGraph
-                 -> BuilderMonad v c IFGraph
-saturateGraph g0 = closureEdges es0 g0
-  where
-    -- Initialize the saturation worklist with all of the predecessor
-    -- edges in the initial graph
-    es0 = HS.fromList $ mapMaybe predToPredSeg $ G.edges g0
-    predToPredSeg (G.Edge l r Pred) = return $ PS l r
-    predToPredSeg _ = Nothing
-
-    -- Here is our problem (possibly also related to the self loops
-    -- appearing).  We find new edges with findEdge, which just
-    -- consults adjacency links.  Some of these refer to old nodes
-    -- that were eliminated?  Shouldn't...  But the edges identified
-    -- might not exist (and will never exist because their endpoints
-    -- are collapsed).
-    closureEdges ns g
-      | HS.null ns = return g
-      | otherwise = do
-        BuilderState _ v _ <- get
-        let inclusions = mapReduceThresh 1024 ns (findAndSimplifyEdge v g) mappend mempty
-        case null inclusions of
-          True -> return g
-          False -> do
-            (g', affectedNodes) <- foldM (addInclusion True) (g, mempty) inclusions
-            closureEdges affectedNodes g'
+                 => IFGraph v c
+                 -> Worklist
+                 -> BuilderMonad v c (IFGraph v c)
+saturateGraph g0 wl0
+  | HS.null wl0 = return g0
+  | otherwise = do
+    let inclusions = mapReduceThresh 1024 wl0 (findAndSimplifyEdge g0) mappend mempty
+    case null inclusions of
+      True -> return g0
+      False -> do
+        (g1, wl1) <- foldM (addInclusion True) (g0, mempty) inclusions
+        saturateGraph g1 wl1
 
 {-# INLINE findAndSimplifyEdge #-}
 findAndSimplifyEdge :: (Eq v, Eq c)
-                       => Vector (SetExpression v c)
-                       -> IFGraph
+                       => IFGraph v c
                        -> PredSegment
                        -> [Inclusion v c]
-findAndSimplifyEdge v g (PS l x) =
-  G.foldSuc (toNewInclusion v g l) mempty g x
+findAndSimplifyEdge g (PS l x) =
+  foldr (toNewInclusion g l) mempty ss
+  where
+    Just (Context _ _ ss) = context g x
 
 {-# INLINE toNewInclusion #-}
 toNewInclusion :: (Eq v, Eq c)
-                  => Vector (SetExpression v c)
-                  -> IFGraph
-                  -> Int
-                  -> Int
-                  -> ConstraintEdge
+                  => IFGraph v c
+                  -> Vertex
+                  -> (ConstraintEdge, Vertex)
                   -> [Inclusion v c]
                   -> [Inclusion v c]
-toNewInclusion _ _ _ _ Pred acc = acc
-toNewInclusion v g l r Succ acc
+toNewInclusion _ _ (Pred, _) acc = acc
+toNewInclusion g l (Succ, r) acc
   | G.edgeExists g l r = acc
   | otherwise =
-    let incl = V.unsafeIndex v l :<= V.unsafeIndex v r
-        Just incl' = simplifyInclusion [] incl
-    in incl' ++ acc
+    let Just lexp = vertexLabel g l
+        Just rexp = vertexLabel g r
+        incl = lexp :<= rexp
+        Just incl' = simplifyInclusion acc incl
+    in incl'
 
 solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
-solvedSystemGraphElems (SolvedSystem g _ v) = (ns, es)
-  where
-    ns = map (\nid -> (nid, V.unsafeIndex v nid)) $ G.vertices g
-    es = map (\(G.Edge s d l) -> (s, d, l)) $ G.edges g
+solvedSystemGraphElems (SolvedSystem g _) = undefined
+  -- where
+  --   ns = map (\nid -> (nid, V.unsafeIndex v nid)) $ G.vertices g
+  --   es = map (\(G.Edge s d l) -> (s, d, l)) $ G.edges g
 
 
 -- Cycle detection
