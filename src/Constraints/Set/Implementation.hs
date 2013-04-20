@@ -27,8 +27,6 @@ import qualified Data.Graph.Interface as G
 import Data.Graph.MutableDigraph
 import Data.Graph.Algorithms.DFS
 import Data.Hashable
-import Data.IntSet ( IntSet )
-import qualified Data.IntSet as IS
 import Data.List ( intercalate )
 import Data.Map ( Map )
 import qualified Data.Map as M
@@ -292,9 +290,9 @@ instance Hashable PredSegment where
 -- need more transitive edges).
 addInclusion :: (Eq c, Ord v, Ord c)
                 => Bool
-                -> (IFGraph, Worklist) -- HashSet PredSegment)
+                -> (IFGraph, Worklist)
                 -> Inclusion v c
-                -> BuilderMonad v c (IFGraph, Worklist) -- HashSet PredSegment)
+                -> BuilderMonad v c (IFGraph, Worklist)
 addInclusion removeCycles acc i =
   case i of
     -- This is the key to an inductive form graph (rather than
@@ -310,48 +308,6 @@ addInclusion removeCycles acc i =
       addEdge removeCycles acc Succ e1 e2
     _ -> error "Constraints.Set.Solver.addInclusion: unexpected expression"
 
--- Track both a visited set and a "the nodes on the cycle" set
-checkChain :: Bool -> ConstraintEdge -> IFGraph -> Int -> Int -> Maybe IntSet
-checkChain False _ _ _ _ = Nothing
-checkChain True tgt g from to = do
-  chain <- snd $ checkChainWorker (mempty, Nothing) tgt g from to
-  return $ IS.insert from chain
-
--- Only checkChainWorker adds things to the visited set
-checkChainWorker :: (IntSet, Maybe IntSet) -> ConstraintEdge -> IFGraph -> Int -> Int -> (IntSet, Maybe IntSet)
-checkChainWorker (visited, chain) tgt g from to
-  | from == to = (visited, Just (IS.singleton to))
-  | otherwise =
-    let visited' = IS.insert from visited
-    in G.foldPre (checkChainEdges tgt g to) (visited', chain) g from
-
--- Once we have a branch of the DFS that succeeds, just keep that
--- value.  This manages augmenting the set of nodes on the chain
-checkChainEdges :: ConstraintEdge
-                   -> IFGraph
-                   -> Int
-                   -> Int
-                   -> ConstraintEdge
-                   -> (IntSet, Maybe IntSet)
-                   -> (IntSet, Maybe IntSet)
-checkChainEdges _ _ _ _ _ acc@(_, Just _) = acc
-checkChainEdges tgt g to v lbl acc@(visited, Nothing)
-  | tgt /= lbl = acc
-  | IS.member v visited = acc
-  | otherwise =
-    -- If there was no hit on this branch, just return the accumulator
-    -- from the recursive call (which has an updated visited set)
-    case checkChainWorker acc tgt g v to of
-      acc'@(_, Nothing) -> acc'
-      (visited', Just chain) -> (visited', Just (IS.insert v chain))
-
--- | Ask if we should bother to check for cycles this iteration
-checkCycles :: BuilderMonad v c Bool
-checkCycles = do
-  BuilderState _ _ cnt <- get
-  case cnt of
-    Nothing -> return True
-    Just c -> return $ c <= 1000
 
 -- | Add an edge in the constraint graph between the two expressions
 -- with the given label.  Adds nodes for the expressions if necessary.
@@ -362,17 +318,19 @@ addEdge :: (Eq v, Eq c, Ord v, Ord c)
            -> SetExpression v c
            -> SetExpression v c
            -> BuilderMonad v c (IFGraph, Worklist)
-addEdge removeCycles acc@(!g0, !affected) etype e1 e2 = do
+addEdge {-removeCycles-}_ acc@(!g0, !affected) etype e1 e2 = do
   (eid1, g1) <- getEID e1 g0
   (eid2, g2) <- getEID e2 g1
   case eid1 == eid2 || G.edgeExists g2 eid1 eid2 of
     True -> return acc
-    False -> do
-      -- b <- checkCycles
-      -- case b && removeCycles of
-      case False of
-        True -> tryCycleDetection removeCycles g2 affected etype eid1 eid2
-        False -> simpleAddEdge g2 affected etype eid1 eid2
+    False -> simpleAddEdge g2 affected etype eid1 eid2
+--
+--       do
+--       -- b <- checkCycles
+--       -- case b && removeCycles of
+--       case False of
+--         True -> tryCycleDetection removeCycles g2 affected etype eid1 eid2
+--         False ->
 
 -- | Add an edge without trying to detect new cycles
 simpleAddEdge :: IFGraph -> Worklist -> ConstraintEdge -> Int -> Int -> BuilderMonad v c (IFGraph, Worklist)
@@ -386,77 +344,7 @@ simpleAddEdge g2 affected etype eid1 eid2 =
     addPredPred eid pid Pred acc =
       HS.insert (PS pid eid) acc
 
--- FIXME: Maybe try to mark nodes as "exhausted" after they can't induce
--- any new edges?
---
--- Also, perhaps use bitmasks instead of sets for something?
 
--- | Try to detect cycles as in FFSA98.  Note that this is currently
--- broken somehow.  It detects cycles just fine, but removing them
--- seems to damage the constraint graph somehow making the solving
--- phase much slower.
-tryCycleDetection :: (Ord c, Ord v) => Bool -> IFGraph
-                     -> Worklist -> ConstraintEdge
-                     -> Int -> Int -> BuilderMonad v c (IFGraph, Worklist)
-tryCycleDetection _ g2 affected Succ eid1 eid2 = simpleAddEdge g2 affected Succ eid1 eid2
-tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
-  case checkChain removeCycles (otherLabel etype) g2 eid1 eid2 of
-    Just chain | not (IS.null chain) -> do
-      -- Make all of the nodes in the cycle refer to the min element
-      -- (the reference bit is taken care of in the node lookup and in
-      -- the result lookup).
-      --
-      -- For each of the nodes in @rest@, repoint their incoming and
-      -- outgoing edges.
-      BuilderState m v c <- get
-      -- Find all of the edges from any node pointing to a node in
-      -- @rest@.  Also find all edges from @rest@ out into the rest of
-      -- the graph.  Then resolve those back to inclusions using @v@
-      -- and call addInclusion over these new inclusions (after
-      -- blowing away the old ones)
-      let (representative, rest) = IS.deleteFindMin chain
-          thisExp = V.unsafeIndex v representative
-          newIncoming = IS.foldr' (srcsOf g2 v chain thisExp) [] rest
-          newInclusions = IS.foldr' (destsOf g2 v chain thisExp) newIncoming rest
-          g3 = IS.foldr' G.removeVertex g2 rest
-          m' = IS.foldr' (replaceWith v representative) m rest
-      put $! BuilderState m' v (fmap (+1) c)
-      foldM (addInclusion False) (g3, affected) newInclusions --  `debug`
-        -- ("Removing " ++ show (IS.size chain) ++ " cycle (" ++ show eid1 ++
-        --  " to " ++ show eid2 ++ "). " ++ show (CG.numNodes g3) ++
-        --  " nodes left in the graph.")
-      -- Nothing was affected because we didn't add any edges
-    _ -> simpleAddEdge g2 affected etype eid1 eid2
-  where
-    otherLabel Succ = Pred
-    otherLabel Pred = Succ
-
-srcsOf :: IFGraph -> Vector (SetExpression v c) -> IntSet
-          -> SetExpression v c -> Int -> [Inclusion v c]
-          -> [Inclusion v c]
-srcsOf g v chain newDst oldId acc =
-  G.foldPre (\srcId _ a ->
-              case IS.member srcId chain of
-                True -> a
-                False -> (V.unsafeIndex v srcId :<= newDst) : a) acc g oldId
-
-destsOf :: IFGraph -> Vector (SetExpression v c) -> IntSet
-          -> SetExpression v c -> Int -> [Inclusion v c]
-          -> [Inclusion v c]
-destsOf g v chain newSrc oldId acc =
-  G.foldSuc (\dstId _ a ->
-              case IS.member dstId chain of
-                True -> a
-                False -> (newSrc :<= V.unsafeIndex v dstId) : a) acc g oldId
-
--- | Change the ID of the node with ID @i@ to @repr@
-replaceWith :: (Ord k) => Vector k -> a -> Int -> Map k a -> Map k a
-replaceWith v repr i m =
-  case M.lookup se m of
-    Nothing -> m
-    Just _ -> M.insert se repr m
-  where
-    se = V.unsafeIndex v i
 
 -- | Get the ID for the expression node.  Inserts a new node into the
 -- graph if needed.
@@ -557,3 +445,125 @@ solvedSystemGraphElems (SolvedSystem g _ v) = (ns, es)
   where
     ns = map (\nid -> (nid, V.unsafeIndex v nid)) $ G.vertices g
     es = map (\(G.Edge s d l) -> (s, d, l)) $ G.edges g
+
+
+-- Cycle detection
+
+{-
+
+-- Track both a visited set and a "the nodes on the cycle" set
+checkChain :: Bool -> ConstraintEdge -> IFGraph -> Int -> Int -> Maybe IntSet
+checkChain False _ _ _ _ = Nothing
+checkChain True tgt g from to = do
+  chain <- snd $ checkChainWorker (mempty, Nothing) tgt g from to
+  return $ IS.insert from chain
+
+-- Only checkChainWorker adds things to the visited set
+checkChainWorker :: (IntSet, Maybe IntSet) -> ConstraintEdge -> IFGraph -> Int -> Int -> (IntSet, Maybe IntSet)
+checkChainWorker (visited, chain) tgt g from to
+  | from == to = (visited, Just (IS.singleton to))
+  | otherwise =
+    let visited' = IS.insert from visited
+    in G.foldPre (checkChainEdges tgt g to) (visited', chain) g from
+
+-- Once we have a branch of the DFS that succeeds, just keep that
+-- value.  This manages augmenting the set of nodes on the chain
+checkChainEdges :: ConstraintEdge
+                   -> IFGraph
+                   -> Int
+                   -> Int
+                   -> ConstraintEdge
+                   -> (IntSet, Maybe IntSet)
+                   -> (IntSet, Maybe IntSet)
+checkChainEdges _ _ _ _ _ acc@(_, Just _) = acc
+checkChainEdges tgt g to v lbl acc@(visited, Nothing)
+  | tgt /= lbl = acc
+  | IS.member v visited = acc
+  | otherwise =
+    -- If there was no hit on this branch, just return the accumulator
+    -- from the recursive call (which has an updated visited set)
+    case checkChainWorker acc tgt g v to of
+      acc'@(_, Nothing) -> acc'
+      (visited', Just chain) -> (visited', Just (IS.insert v chain))
+
+-- | Ask if we should bother to check for cycles this iteration
+checkCycles :: BuilderMonad v c Bool
+checkCycles = do
+  BuilderState _ _ cnt <- get
+  case cnt of
+    Nothing -> return True
+    Just c -> return $ c <= 1000
+
+-- FIXME: Maybe try to mark nodes as "exhausted" after they can't induce
+-- any new edges?
+--
+-- Also, perhaps use bitmasks instead of sets for something?
+
+-- | Try to detect cycles as in FFSA98.  Note that this is currently
+-- broken somehow.  It detects cycles just fine, but removing them
+-- seems to damage the constraint graph somehow making the solving
+-- phase much slower.
+tryCycleDetection :: (Ord c, Ord v) => Bool -> IFGraph
+                     -> Worklist -> ConstraintEdge
+                     -> Int -> Int -> BuilderMonad v c (IFGraph, Worklist)
+tryCycleDetection _ g2 affected Succ eid1 eid2 = simpleAddEdge g2 affected Succ eid1 eid2
+tryCycleDetection removeCycles g2 affected etype eid1 eid2 =
+  case checkChain removeCycles (otherLabel etype) g2 eid1 eid2 of
+    Just chain | not (IS.null chain) -> do
+      -- Make all of the nodes in the cycle refer to the min element
+      -- (the reference bit is taken care of in the node lookup and in
+      -- the result lookup).
+      --
+      -- For each of the nodes in @rest@, repoint their incoming and
+      -- outgoing edges.
+      BuilderState m v c <- get
+      -- Find all of the edges from any node pointing to a node in
+      -- @rest@.  Also find all edges from @rest@ out into the rest of
+      -- the graph.  Then resolve those back to inclusions using @v@
+      -- and call addInclusion over these new inclusions (after
+      -- blowing away the old ones)
+      let (representative, rest) = IS.deleteFindMin chain
+          thisExp = V.unsafeIndex v representative
+          newIncoming = IS.foldr' (srcsOf g2 v chain thisExp) [] rest
+          newInclusions = IS.foldr' (destsOf g2 v chain thisExp) newIncoming rest
+          g3 = IS.foldr' G.removeVertex g2 rest
+          m' = IS.foldr' (replaceWith v representative) m rest
+      put $! BuilderState m' v (fmap (+1) c)
+      foldM (addInclusion False) (g3, affected) newInclusions --  `debug`
+        -- ("Removing " ++ show (IS.size chain) ++ " cycle (" ++ show eid1 ++
+        --  " to " ++ show eid2 ++ "). " ++ show (CG.numNodes g3) ++
+        --  " nodes left in the graph.")
+      -- Nothing was affected because we didn't add any edges
+    _ -> simpleAddEdge g2 affected etype eid1 eid2
+  where
+    otherLabel Succ = Pred
+    otherLabel Pred = Succ
+
+srcsOf :: IFGraph -> Vector (SetExpression v c) -> IntSet
+          -> SetExpression v c -> Int -> [Inclusion v c]
+          -> [Inclusion v c]
+srcsOf g v chain newDst oldId acc =
+  G.foldPre (\srcId _ a ->
+              case IS.member srcId chain of
+                True -> a
+                False -> (V.unsafeIndex v srcId :<= newDst) : a) acc g oldId
+
+destsOf :: IFGraph -> Vector (SetExpression v c) -> IntSet
+          -> SetExpression v c -> Int -> [Inclusion v c]
+          -> [Inclusion v c]
+destsOf g v chain newSrc oldId acc =
+  G.foldSuc (\dstId _ a ->
+              case IS.member dstId chain of
+                True -> a
+                False -> (newSrc :<= V.unsafeIndex v dstId) : a) acc g oldId
+
+-- | Change the ID of the node with ID @i@ to @repr@
+replaceWith :: (Ord k) => Vector k -> a -> Int -> Map k a -> Map k a
+replaceWith v repr i m =
+  case M.lookup se m of
+    Nothing -> m
+    Just _ -> M.insert se repr m
+  where
+    se = V.unsafeIndex v i
+
+-}
