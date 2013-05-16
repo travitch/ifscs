@@ -22,7 +22,8 @@ module Constraints.Set.Implementation (
 import Control.DeepSeq
 import Control.Exception
 import Control.Failure
-import Control.Monad.State.Strict
+import Control.Monad ( foldM )
+import Control.Monad.Trans.State.Strict
 import Data.Graph.Haggle as G
 import Data.Graph.Haggle.PatriciaTree
 import Data.Graph.Haggle.Algorithms.DFS as G
