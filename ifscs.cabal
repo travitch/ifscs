@@ -1,5 +1,5 @@
 name:                ifscs
-version:             0.1.0.0
+version:             0.2.0.0
 synopsis:            An inductive-form set constraint solver
 license:             BSD3
 license-file:        LICENSE
@@ -16,19 +16,11 @@ description: This is an implementation of an (inclusion) set constraint
 
 library
   default-language: Haskell2010
-  exposed-modules: Constraints.Set.Solver,
-                   Constraints.Set.Internal
-  other-modules: Constraints.Set.Implementation,
-                 Constraints.Set.MapReduce
+  exposed-modules: Constraints.Set.Solver
+  other-modules: Constraints.Set.Implementation
   build-depends: base == 4.*,
-                 mtl > 2,
-                 monad-par >= 0.3,
-                 haggle,
-                 failure,
-                 containers,
-                 hashable,
-                 unordered-containers,
-                 deepseq
+                 failure >= 0.2 && < 0.3,
+                 containers
   hs-source-dirs: src
   ghc-options: -Wall
   ghc-prof-options: -auto-all

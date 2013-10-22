@@ -1,4 +1,5 @@
-{-# LANGUAGE FlexibleContexts, ScopedTypeVariables, DeriveDataTypeable #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE BangPatterns #-}
 module Constraints.Set.Implementation (
   ConstraintError(..),
@@ -13,75 +14,48 @@ module Constraints.Set.Implementation (
   term,
   (<=!),
   solveSystem,
-  leastSolution,
-  -- * Debugging
-  ConstraintEdge(..),
-  solvedSystemGraphElems
+  leastSolution
   ) where
 
-import Control.DeepSeq
 import Control.Exception
 import Control.Failure
-import Control.Monad.State.Strict
-import Data.Graph.Haggle as G
-import Data.Graph.Haggle.PatriciaTree
-import Data.Graph.Haggle.Algorithms.DFS as G
-import Data.Hashable
-import Data.List ( intercalate )
+import qualified Data.Foldable as F
+import Data.Function ( on )
+import qualified Data.List as L
 import Data.Map ( Map )
 import qualified Data.Map as M
-import Data.Maybe ( catMaybes, mapMaybe )
+import Data.Maybe ( fromMaybe )
 import Data.Monoid
-import Data.HashSet ( HashSet )
-import qualified Data.HashSet as HS
+import Data.Set ( Set )
+import qualified Data.Set as S
 import Data.Typeable
 
-import Constraints.Set.MapReduce
-
-
-type Worklist = HashSet PredSegment
-
-data ConstraintEdge = Succ | Pred
-                    deriving (Eq, Ord, Show)
+type Worklist v c = Set (PredSegment v c)
 
 -- | The type used to represent that inductive form constraint graph
 -- during saturation.  This form is more efficient to saturate.
-type IFGraph v c = PatriciaTree (SetExpression v c) ConstraintEdge
+type IFGraph v c = Map (SetExpression v c) (Edges v c)
 
--- | The type representing the inductive constraint graph after it has
--- been saturated.  This change in representations is used to make DFS
--- queries easier.
--- type SolvedGraph = DenseDigraph () ConstraintEdge
+data Edges v c = Edges { predecessors :: Set (SetExpression v c)
+                       , successors :: Set (SetExpression v c)
+                       }
+               deriving (Eq, Ord)
 
 -- | The solved constraint system
 data SolvedSystem v c =
-  SolvedSystem { systemIFGraph :: IFGraph v c
-               , systemSetToIdMap :: Map (SetExpression v c) Vertex
-               }
+  SolvedSystem { systemIFGraph :: IFGraph v c  }
 
 instance (Eq v, Eq c) => Eq (SolvedSystem v c) where
-  (SolvedSystem g1 m1) == (SolvedSystem g2 m2) =
-    m1 == m2 && labeledVertices g1 == labeledVertices g2 && labeledEdges g1 == labeledEdges g2
+  (==) = (==) `on` systemIFGraph
 
--- | Metadata used to construct the constraint graph from the initial
--- inclusion constraints.  This maps set expressions to unique Int
--- identifiers, which are faster to reference during saturation.  The
--- expressions themselves don't matter during saturation.
-data BuilderState v c = BuilderState { exprIdMap :: Map (SetExpression v c) Vertex }
 
--- | The monadic environment in which the constraint graph is built
--- and solved.
--- type BuilderMonad v c = State (BuilderState v c)
-type BuilderMonad v c = State (BuilderState v c)
--- | This is just a strict (and unboxed) pair representing an edge
--- being added to the worklist because it will be the base of a new
--- closure edge.
-data PredSegment = PS {-# UNPACK #-} !Vertex {-# UNPACK #-} !Vertex
-                 deriving (Eq, Ord)
-
-instance Hashable PredSegment where
-  hashWithSalt s (PS l r) =
-    s `hashWithSalt` l `hashWithSalt` r
+-- | A type describing an edge added in one iteration of the
+-- transitive closure.  These let us know which nodes need to be
+-- revisited in the next iteration (and in which direction -
+-- predecessor or successor)
+data PredSegment v c = PSPred (SetExpression v c) (SetExpression v c)
+                     | PSSucc (SetExpression v c) (SetExpression v c)
+                     deriving (Eq, Ord)
 
 -- | Create a set expression representing the empty set
 emptySet :: SetExpression v c
@@ -92,13 +66,13 @@ universalSet :: SetExpression v c
 universalSet = UniversalSet
 
 -- | Create a new set variable with the given label
-setVariable :: v -> SetExpression v c
+setVariable :: (Ord v) => v -> SetExpression v c
 setVariable = SetVariable
 
 -- | Atomic terms have a label and arity zero.  This is a shortcut for
 --
 -- > term conLabel [] []
-atom :: c -> SetExpression v c
+atom :: (Ord c) => c -> SetExpression v c
 atom conLabel = ConstructedTerm conLabel [] []
 
 -- | This returns a function to create terms from lists of
@@ -110,14 +84,14 @@ atom conLabel = ConstructedTerm conLabel [] []
 -- Contravariant) for each argument of the term.  A mismatch in the
 -- length of the variance descriptor and the arguments to the term
 -- will result in a run-time error.
-term :: c -> [Variance] -> ([SetExpression v c] -> SetExpression v c)
+term :: (Ord v, Ord c) => c -> [Variance] -> ([SetExpression v c] -> SetExpression v c)
 term = ConstructedTerm
 
 -- | Construct an inclusion relation between two set expressions.
 --
 -- This is equivalent to @se1 ⊆ se2@.
-(<=!) :: SetExpression v c -> SetExpression v c -> Inclusion v c
-(<=!) = (:<=)
+(<=!) :: (Ord c, Ord v) => SetExpression v c -> SetExpression v c -> Inclusion v c
+(<=!) = Inclusion
 
 -- | Tags to mark term arguments as covariant or contravariant.
 data Variance = Covariant | Contravariant
@@ -130,30 +104,25 @@ data SetExpression v c = EmptySet
                        | ConstructedTerm c [Variance] [SetExpression v c]
                        deriving (Eq, Ord)
 
--- Fake instance because we never create new SetExpressions during
--- saturation.
-instance NFData (SetExpression v c) where
-  rnf _ = ()
-
-instance NFData (Inclusion v c) where
-  rnf (_ :<= _) = ()
-
 instance (Show v, Show c) => Show (SetExpression v c) where
   show EmptySet = "∅"
   show UniversalSet = "U"
   show (SetVariable v) = show v
   show (ConstructedTerm c _ es) =
     concat [ show c, "("
-           , intercalate ", " (map show es)
+           , L.intercalate ", " (map show es)
            , ")"
            ]
 
 -- | An inclusion is a constraint of the form @se1 ⊆ se2@
-data Inclusion v c = (SetExpression v c) :<= (SetExpression v c)
-                   deriving (Eq, Ord)
+data Inclusion v c =
+  Inclusion (SetExpression v c) (SetExpression v c)
+  deriving (Eq, Ord)
+
+
 
 instance (Show v, Show c) => Show (Inclusion v c) where
-  show (lhs :<= rhs) = concat [ show lhs, " ⊆ ", show rhs ]
+  show (Inclusion lhs rhs) = concat [ show lhs, " ⊆ ", show rhs ]
 
 -- | The types of errors that can be encountered during constraint
 -- resolution
@@ -165,52 +134,59 @@ instance (Typeable v, Typeable c, Show v, Show c) => Exception (ConstraintError 
 
 -- | Simplify one set expression.  The expression may be eliminated,
 -- passed through unchanged, or split into multiple new expressions.
-simplifyInclusion :: (Failure (ConstraintError v c) m, Eq v, Eq c)
-                     => [Inclusion v c] -- ^ An accumulator list
-                     -> Inclusion v c -- ^ The inclusion to be simplified
-                     -> m [Inclusion v c]
-simplifyInclusion acc i =
+simplifyInclusion :: (Ord c, Ord v, Eq v, Eq c)
+                     => Inclusion v c -- ^ The inclusion to be simplified
+                     -> [Inclusion v c]
+simplifyInclusion i =
   case i of
     -- Eliminate constraints of the form A ⊆ A
-    SetVariable v1 :<= SetVariable v2 ->
-      if v1 == v2 then return acc else return (i : acc)
-    UniversalSet :<= EmptySet ->
-      failure (NoSolution i)
-    ConstructedTerm c1 s1 ses1 :<= ConstructedTerm c2 s2 ses2 ->
+    Inclusion (SetVariable v1) (SetVariable v2) ->
+      if v1 == v2 then [] else [i]
+    Inclusion UniversalSet EmptySet ->
+      error "Malformed constraint univ < emptyset"
+    Inclusion (ConstructedTerm c1 s1 ses1) (ConstructedTerm c2 s2 ses2) ->
       let sigLen = length s1
           triples = zip3 s1 ses1 ses2
       in case c1 == c2 && s1 == s2 && sigLen == length ses1 && sigLen == length ses2 of
-        False -> failure (NoSolution i)
-        True -> foldM simplifyWithVariance acc triples
-    UniversalSet :<= ConstructedTerm _ _ _ -> failure (NoSolution i)
-    ConstructedTerm _ _ _ :<= EmptySet -> failure (NoSolution i)
+        False -> error "Malformed constraint cterm mismatch"
+        True -> concatMap simplifyWithVariance triples
+    Inclusion UniversalSet (ConstructedTerm _ _ _) ->
+      error "Malformed constraint univ < cterm"
+    Inclusion (ConstructedTerm _ _ _) EmptySet ->
+      error "Malformed constraint cterm < emptyset"
     -- Eliminate constraints of the form A ⊆ 1
-    _ :<= UniversalSet -> return acc
+    Inclusion _ UniversalSet -> []
     -- 0 ⊆ A
-    EmptySet :<= _ -> return acc
+    Inclusion EmptySet _ -> []
     -- Keep anything else (atomic forms)
-    _ -> return (i : acc)
+    _ -> [i]
 
 -- | Simplifies an inclusion taking variance into account; this is a
 -- helper for 'simplifyInclusion' that deals with the variance of
 -- constructed terms.  The key here is that contravariant inclusions
 -- are /flipped/.
-simplifyWithVariance :: (Failure (ConstraintError v c) m, Eq v, Eq c)
-                        => [Inclusion v c]
-                        -> (Variance, SetExpression v c, SetExpression v c)
-                        -> m [Inclusion v c]
-simplifyWithVariance acc (Covariant, se1, se2) =
-  simplifyInclusion acc (se1 :<= se2)
-simplifyWithVariance acc (Contravariant, se1, se2) =
-  simplifyInclusion acc (se2 :<= se1)
+simplifyWithVariance :: (Ord c, Ord v, Eq v, Eq c)
+                        => (Variance, SetExpression v c, SetExpression v c)
+                        -> [Inclusion v c]
+simplifyWithVariance (Covariant, se1, se2) =
+  simplifyInclusion (Inclusion se1 se2)
+simplifyWithVariance (Contravariant, se1, se2) =
+  simplifyInclusion (Inclusion se2 se1)
 
 -- | Simplify all of the inclusions in the initial constraint system.
-simplifySystem :: (Failure (ConstraintError v c) m, Eq v, Eq c)
+simplifySystem :: (Ord c, Ord v, Eq v, Eq c)
                   => [Inclusion v c]
-                  -> m [Inclusion v c]
-simplifySystem = foldM simplifyInclusion []
+                  -> [Inclusion v c]
+simplifySystem = concatMap simplifyInclusion
 
-
+dfs :: (Ord c, Ord v) => IFGraph v c -> SetExpression v c -> Set (SetExpression v c)
+dfs g = go mempty
+  where
+    go !visited v =
+      case M.lookup v g of
+        Nothing -> visited
+        Just Edges { predecessors = ps } ->
+          F.foldl' go (S.union ps visited) ps
 
 -- | Compute the least solution for the given variable.  This can fail
 -- if the requested variable is not present in the constraint system
@@ -218,132 +194,96 @@ simplifySystem = foldM simplifyInclusion []
 --
 -- LS(y) = All source nodes with a predecessor edge to y, plus LS(x)
 -- for all x where x has a predecessor edge to y.
-leastSolution :: forall c m v . (Failure (ConstraintError v c) m, Ord v, Ord c)
+leastSolution :: (Failure (ConstraintError v c) m, Ord v, Ord c)
                  => SolvedSystem v c
                  -> v
                  -> m [SetExpression v c]
-leastSolution (SolvedSystem g0 m) varLabel = do
-  case M.lookup (SetVariable varLabel) m of
-    Nothing -> failure ex
-    Just nid -> return $ catMaybes $ rdfsWith g0 (addTerm g0) [nid]
+leastSolution (SolvedSystem g0) varLabel = do
+  let reached = dfs g0 (SetVariable varLabel)
+  return $ F.foldr addTerm [] reached
   where
-    ex :: ConstraintError v c
-    ex = NoVariableLabel varLabel
+    -- ex :: ConstraintError v c
+    -- ex = NoVariableLabel varLabel
 
-    -- We only want to add ConstructedTerms to the output list
-    addTerm :: IFGraph v c -> Vertex -> Maybe (SetExpression v c)
-    addTerm g v = do
-      let Just se = vertexLabel g v
-      case se of
-        ConstructedTerm _ _ _ -> return se
-        _ -> Nothing
+    addTerm v acc =
+      case v of
+        ConstructedTerm _ _ _ -> v : acc
+        _ -> acc
 
 -- | Simplify and solve the system of set constraints
 solveSystem :: (Failure (ConstraintError v c) m, Eq c, Eq v, Ord c, Ord v)
                => [Inclusion v c]
                -> m (SolvedSystem v c)
-solveSystem s = do
-  s' <- simplifySystem s
-  return $! constraintsToIFGraph s'
+solveSystem = return . constraintsToIFGraph . simplifySystem
 
 -- | The real worker to solve the system and convert from an IFGraph
 -- to a SolvedGraph.
 constraintsToIFGraph :: (Ord v, Ord c) => [Inclusion v c] -> SolvedSystem v c
 constraintsToIFGraph is =
-  SolvedSystem { systemIFGraph = g
-               , systemSetToIdMap = m
-               }
+  SolvedSystem { systemIFGraph = saturateGraph g0 wl }
   where
-    s0 = BuilderState { exprIdMap = mempty
-                      }
-    -- The initial graph has all of the nodes we need; after that we
-    -- just need to saturate the edges through transitive closure
-    (g, bs) = runState act s0
-    act = do
-      (theGraph, wl) <- buildInitialGraph is
-      saturateGraph theGraph wl
-    BuilderState m = bs
+    (g0, wl) = buildInitialGraph is
 
 -- | Build an initial IF constraint graph that contains all of the
 -- vertices and the edges induced by the initial simplified constraint
 -- system.
-buildInitialGraph :: (Ord v, Ord c) => [Inclusion v c] -> BuilderMonad v c (IFGraph v c, Worklist)
-buildInitialGraph is = do
-  foldM (addInclusion True) (G.emptyGraph, mempty) is
+buildInitialGraph :: (Ord v, Ord c)
+                     => [Inclusion v c]
+                     -> (IFGraph v c, Worklist v c)
+buildInitialGraph is = L.foldl' addInclusion (mempty, mempty) is
 
 -- | Adds an inclusion to the constraint graph (adding vertices if
 -- necessary).  Returns the set of nodes that are affected (and will
 -- need more transitive edges).
 addInclusion :: (Eq c, Ord v, Ord c)
-                => Bool
-                -> (IFGraph v c, Worklist)
+                => (IFGraph v c, Worklist v c)
                 -> Inclusion v c
-                -> BuilderMonad v c (IFGraph v c, Worklist)
-addInclusion removeCycles acc i =
+                -> (IFGraph v c, Worklist v c)
+addInclusion acc i =
   case i of
     -- This is the key to an inductive form graph (rather than
     -- standard form)
-    e1@(SetVariable v1) :<= e2@(SetVariable v2) ->
-      case compare v1 v2 of
-        EQ -> error "Constraints.Set.Solver.addInclusion: invalid A ⊆ A constraint"
-        GT -> addConstraintEdge removeCycles acc Pred e1 e2
-        LT -> addConstraintEdge removeCycles acc Succ e1 e2
-    e1@(ConstructedTerm _ _ _) :<= e2@(SetVariable _) ->
-      addConstraintEdge removeCycles acc Pred e1 e2
-    e1@(SetVariable _) :<= e2@(ConstructedTerm _ _ _) ->
-      addConstraintEdge removeCycles acc Succ e1 e2
+    Inclusion e1@(SetVariable v1) e2@(SetVariable v2)
+      | v1 < v2 -> addSuccEdge acc e1 e2
+      | otherwise -> addPredEdge acc e1 e2
+    Inclusion e1@(ConstructedTerm _ _ _) e2@(SetVariable _) ->
+      addPredEdge acc e1 e2
+    Inclusion e1@(SetVariable _) e2@(ConstructedTerm _ _ _) ->
+      addSuccEdge acc e1 e2
     _ -> error "Constraints.Set.Solver.addInclusion: unexpected expression"
 
+-- | Add a predecessor edge (l is a predecessor of r)
+addPredEdge :: (Ord c, Ord v)
+               => (IFGraph v c, Worklist v c)
+               -> SetExpression v c
+               -> SetExpression v c
+               -> (IFGraph v c, Worklist v c)
+addPredEdge acc@(!g, !work) l r =
+  case M.lookup r g of
+    Nothing ->
+      let es = Edges { predecessors = S.singleton l, successors = S.empty }
+      in (M.insert r es g, S.insert (PSPred l r) work)
+    Just es
+      | S.member l (predecessors es) -> acc
+      | otherwise ->
+        let es' = es { predecessors = S.insert l (predecessors es) }
+        in (M.insert r es' g, S.insert (PSPred l r) work)
 
--- | Add an edge in the constraint graph between the two expressions
--- with the given label.  Adds nodes for the expressions if necessary.
-addConstraintEdge :: (Eq v, Eq c, Ord v, Ord c)
-                  => Bool
-                  -> (IFGraph v c, Worklist)
-                  -> ConstraintEdge
-                  -> SetExpression v c
-                  -> SetExpression v c
-                  -> BuilderMonad v c (IFGraph v c, Worklist)
-addConstraintEdge {-removeCycles-}_ acc@(!g0, !affected) etype e1 e2 = do
-  (eid1, g1) <- getEID e1 g0
-  (eid2, g2) <- getEID e2 g1
-  case eid1 == eid2 || G.edgeExists g2 eid1 eid2 of
-    True -> return acc
-    False -> simpleAddEdge g2 affected etype eid1 eid2
-
--- | Add an edge without trying to detect new cycles
-simpleAddEdge :: IFGraph v c -> Worklist -> ConstraintEdge -> Vertex -> Vertex -> BuilderMonad v c (IFGraph v c, Worklist)
-simpleAddEdge g2 affected etype eid1 eid2 =
-  case etype of
-    Pred -> return (g3, HS.insert (PS eid1 eid2) affected)
-    Succ -> do
-      let Just (Context pp _ _) = context g2 eid1
-      return (g3, foldr (addPredPred eid1) affected pp)
-  where
-    Just (_, g3) = G.insertLabeledEdge g2 eid1 eid2 etype
-    addPredPred _ (Succ, _) acc = acc
-    addPredPred eid (Pred, pid) acc =
-      HS.insert (PS pid eid) acc
-
-
-
--- | Get the ID for the expression node.  Inserts a new node into the
--- graph if needed.
-getEID :: (Ord v, Ord c)
-          => SetExpression v c
-          -> IFGraph v c
-          -> BuilderMonad v c (Vertex, IFGraph v c)
-getEID e g = do
-  BuilderState m <- get
-  case M.lookup e m of
-    -- Even if we find the ID for the expression, we have to check to
-    -- see if the node has been renamed due to cycle elimination
-    Just v -> return (v, g)
-    Nothing -> do
-      let (v, g') = insertLabeledVertex g e
-          !m' = M.insert e v m
-      put $! BuilderState m'
-      return (v, g')
+addSuccEdge :: (Ord c, Ord v)
+               => (IFGraph v c, Worklist v c)
+               -> SetExpression v c
+               -> SetExpression v c
+               -> (IFGraph v c, Worklist v c)
+addSuccEdge acc@(!g, !work) l r =
+  case M.lookup l g of
+    Nothing ->
+      let es = Edges { predecessors = S.empty, successors = S.singleton r }
+      in (M.insert l es g, S.insert (PSSucc l r) work)
+    Just es
+      | S.member r (successors es) -> acc
+      | otherwise ->
+        let es' = es { successors = S.insert r (successors es) }
+        in (M.insert l es' g, S.insert (PSSucc l r) work)
 
 -- | For each node L in the graph, follow its predecessor edges to
 -- obtain set X.  For each ndoe in X, follow its successor edges
@@ -365,52 +305,30 @@ getEID e g = do
 -- This function can fail if a constraint generated by the saturation
 -- implies that no solution is possible.  I think that probably
 -- shouldn't ever happen but I have no proof.
-saturateGraph :: (Eq v, Eq c, Ord v, Ord c)
+saturateGraph :: (Ord v, Ord c, Eq c)
                  => IFGraph v c
-                 -> Worklist
-                 -> BuilderMonad v c (IFGraph v c)
-saturateGraph g0 wl0
-  | HS.null wl0 = return g0
-  | otherwise = do
-    let inclusions = mapReduceThresh 1024 wl0 (findAndSimplifyEdge g0) mappend mempty
-    case null inclusions of
-      True -> return g0
-      False -> do
-        (g1, wl1) <- foldM (addInclusion True) (g0, mempty) inclusions
-        saturateGraph g1 wl1
+                 -> Worklist v c
+                 -> IFGraph v c
+saturateGraph g0 wl0 =
+  let (g1, wl1) = F.foldl' addNewEdges (g0, mempty) wl0
+  in if S.null wl1 then g1 else saturateGraph g1 wl1
 
-{-# INLINE findAndSimplifyEdge #-}
-findAndSimplifyEdge :: (Eq v, Eq c)
-                       => IFGraph v c
-                       -> PredSegment
-                       -> [Inclusion v c]
-findAndSimplifyEdge g (PS l x) =
-  foldr (toNewInclusion g l) mempty ss
+addNewEdges :: (Ord v, Ord c)
+               => (IFGraph v c, Worklist v c)
+               -> PredSegment v c
+               -> (IFGraph v c, Worklist v c)
+addNewEdges acc@(!g0, _) (PSPred l r) = fromMaybe acc $ do
+  Edges { successors = ss } <- M.lookup r g0
+  return $ F.foldl' (addNewInclusions l) acc ss
   where
-    Just (Context _ _ ss) = context g x
-
-{-# INLINE toNewInclusion #-}
-toNewInclusion :: (Eq v, Eq c)
-                  => IFGraph v c
-                  -> Vertex
-                  -> (ConstraintEdge, Vertex)
-                  -> [Inclusion v c]
-                  -> [Inclusion v c]
-toNewInclusion _ _ (Pred, _) acc = acc
-toNewInclusion g l (Succ, r) acc
-  | G.edgeExists g l r = acc
-  | otherwise =
-    let Just lexp = vertexLabel g l
-        Just rexp = vertexLabel g r
-        incl = lexp :<= rexp
-        Just incl' = simplifyInclusion acc incl
-    in incl'
-
-solvedSystemGraphElems :: (Eq v, Eq c) => SolvedSystem v c -> ([(Int, SetExpression v c)], [(Int, Int, ConstraintEdge)])
-solvedSystemGraphElems (SolvedSystem g _) = undefined
-  -- where
-  --   ns = map (\nid -> (nid, V.unsafeIndex v nid)) $ G.vertices g
-  --   es = map (\(G.Edge s d l) -> (s, d, l)) $ G.edges g
+    addNewInclusions lhs a rhs =
+      F.foldl' addInclusion a $ simplifyInclusion (Inclusion lhs rhs)
+addNewEdges acc@(!g0, _) (PSSucc l r) = fromMaybe acc $ do
+  Edges { predecessors = ps } <- M.lookup l g0
+  return $ F.foldl' (addNewInclusions r) acc ps
+  where
+    addNewInclusions rhs a lhs =
+      F.foldl' addInclusion a $ simplifyInclusion (Inclusion lhs rhs)
 
 
 -- Cycle detection

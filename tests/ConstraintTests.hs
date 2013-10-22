@@ -173,7 +173,7 @@ solveFor name var expected is =
     Just solved = solveSystem is
     Just sol = leastSolution solved var
 
-toSetExp :: Int -> SetExpression v Int
+toSetExp :: (Ord v) => Int -> SetExpression v Int
 toSetExp i = term i [] []
 
 -- | Points-to example from the paper, a = &b;
