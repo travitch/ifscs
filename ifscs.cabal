@@ -4,7 +4,7 @@ synopsis:            An inductive-form set constraint solver
 license:             BSD3
 license-file:        LICENSE
 author:              Tristan Ravitch
-maintainer:          travitch@cs.wisc.edu
+maintainer:          tristan@nochair.net
 category:            Constraints
 build-type:          Simple
 cabal-version:       >=1.10
