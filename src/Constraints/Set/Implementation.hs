@@ -182,11 +182,13 @@ simplifySystem = concatMap simplifyInclusion
 dfs :: (Ord c, Ord v) => IFGraph v c -> SetExpression v c -> Set (SetExpression v c)
 dfs g = go mempty
   where
-    go !visited v =
-      case M.lookup v g of
-        Nothing -> visited
-        Just Edges { predecessors = ps } ->
-          F.foldl' go (S.union ps visited) ps
+    go !visited v
+      | S.member v visited = visited
+      | otherwise =
+          case M.lookup v g of
+            Nothing -> visited
+            Just Edges { predecessors = ps } ->
+              F.foldl' go (S.union ps visited) ps
 
 -- | Compute the least solution for the given variable.  This can fail
 -- if the requested variable is not present in the constraint system
