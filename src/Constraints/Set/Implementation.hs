@@ -188,7 +188,7 @@ dfs g = go mempty
           case M.lookup v g of
             Nothing -> visited
             Just Edges { predecessors = ps } ->
-              F.foldl' go (S.union ps visited) ps
+              F.foldl' go (S.insert v visited) ps
 
 -- | Compute the least solution for the given variable.  This can fail
 -- if the requested variable is not present in the constraint system
