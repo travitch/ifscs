@@ -1,5 +1,5 @@
 name:                ifscs
-version:             0.2.0.0
+version:             0.2.0.1
 synopsis:            An inductive-form set constraint solver
 license:             BSD3
 license-file:        LICENSE
