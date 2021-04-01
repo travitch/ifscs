@@ -186,7 +186,7 @@ dfs g = go mempty
       | S.member v visited = visited
       | otherwise =
           case M.lookup v g of
-            Nothing -> visited
+            Nothing -> S.insert v visited
             Just Edges { predecessors = ps } ->
               F.foldl' go (S.insert v visited) ps
 
